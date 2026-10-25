@@ -2,8 +2,22 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:iou_debt_tracker/models/debt.dart';
 import 'package:iou_debt_tracker/services/debt_service.dart';
 import 'package:iou_debt_tracker/services/interest_service.dart';
+import 'package:iou_debt_tracker/services/notification_service.dart';
 
 import '../helpers/mocks.dart';
+
+/// No-ops the notification plugin so service calls never touch it in the
+/// test environment.
+class _FakeNotificationService extends NotificationService {
+  @override
+  Future<void> scheduleDebtReminder(Debt debt) async {}
+
+  @override
+  Future<void> cancelDebtReminder(int debtId) async {}
+
+  @override
+  Future<void> rescheduleDebtReminder(Debt debt) async {}
+}
 
 void main() {
   late MockDebtRepository mockRepo;
@@ -13,7 +27,8 @@ void main() {
   setUp(() {
     mockRepo = MockDebtRepository();
     interestService = InterestService(mockRepo);
-    debtService = DebtService(mockRepo, interestService);
+    debtService = DebtService(mockRepo, interestService,
+        notificationService: _FakeNotificationService());
   });
 
   group('Debt CRUD', () {
@@ -121,6 +136,262 @@ void main() {
       final payments = await debtService.getPaymentHistory(debt.id!);
       expect(payments.length, 2);
       expect(payments.map((p) => p.paymentAmount), containsAll([200.0, 300.0]));
+    });
+  });
+
+  group('Payment validation', () {
+    test('rejects payments on unsaved debts', () async {
+      final unsaved = Debt(
+          lenderName: 'Alice',
+          amount: 100.0,
+          remainingBalance: 100.0,
+          createdAt: DateTime(2024, 1, 1),
+          transactionDate: DateTime(2024, 1, 1));
+      await expectLater(
+        debtService.recordPayment(debt: unsaved, amount: 10.0),
+        throwsArgumentError,
+      );
+    });
+
+    test('rejects zero and negative amounts', () async {
+      await debtService.addDebt(
+        lenderName: 'Alice',
+        amount: 100.0,
+        transactionDate: DateTime(2024, 1, 1),
+      );
+      final debt = (await debtService.getDebts()).first;
+      await expectLater(
+        debtService.recordPayment(debt: debt, amount: 0.0),
+        throwsArgumentError,
+      );
+      await expectLater(
+        debtService.recordPayment(debt: debt, amount: -5.0),
+        throwsArgumentError,
+      );
+    });
+
+    test('rejects payments exceeding the remaining balance', () async {
+      await debtService.addDebt(
+        lenderName: 'Alice',
+        amount: 100.0,
+        transactionDate: DateTime(2024, 1, 1),
+      );
+      final debt = (await debtService.getDebts()).first;
+      await expectLater(
+        debtService.recordPayment(debt: debt, amount: 150.0),
+        throwsArgumentError,
+      );
+      expect((await debtService.getDebts()).first.remainingBalance, 100.0);
+    });
+  });
+
+  group('Amount reconciliation on edit', () {
+    test('amount cut reduces the remaining balance, not paid progress',
+        () async {
+      await debtService.addDebt(
+        lenderName: 'Alice',
+        amount: 1000.0,
+        transactionDate: DateTime(2024, 1, 1),
+      );
+      final debt = (await debtService.getDebts()).first;
+      await debtService.recordPayment(debt: debt, amount: 300.0);
+      final fresh = (await debtService.getDebtById(debt.id!))!;
+
+      await debtService.updateDebt(
+        fresh,
+        lenderName: 'Alice',
+        amount: 500.0,
+        transactionDate: DateTime(2024, 1, 1),
+      );
+
+      final updated = (await debtService.getDebtById(debt.id!))!;
+      expect(updated.remainingBalance, 200.0);
+      expect(updated.status, DebtStatus.partial);
+    });
+
+    test('amount cut below balance-negatives clamps to paid', () async {
+      await debtService.addDebt(
+        lenderName: 'Alice',
+        amount: 1000.0,
+        transactionDate: DateTime(2024, 1, 1),
+      );
+      final debt = (await debtService.getDebts()).first;
+      await debtService.recordPayment(debt: debt, amount: 300.0);
+      final fresh = (await debtService.getDebtById(debt.id!))!;
+
+      await debtService.updateDebt(
+        fresh,
+        lenderName: 'Alice',
+        amount: 200.0,
+        transactionDate: DateTime(2024, 1, 1),
+      );
+
+      final updated = (await debtService.getDebtById(debt.id!))!;
+      expect(updated.remainingBalance, 0.0);
+      expect(updated.status, DebtStatus.paid);
+      expect(updated.isPaid, true);
+    });
+
+    test('amount raise on an untouched debt keeps it fully unpaid', () async {
+      await debtService.addDebt(
+        lenderName: 'Alice',
+        amount: 1000.0,
+        transactionDate: DateTime(2024, 1, 1),
+      );
+      final debt = (await debtService.getDebts()).first;
+
+      await debtService.updateDebt(
+        debt,
+        lenderName: 'Alice',
+        amount: 1500.0,
+        transactionDate: DateTime(2024, 1, 1),
+      );
+
+      final updated = (await debtService.getDebtById(debt.id!))!;
+      expect(updated.remainingBalance, 1500.0);
+      expect(updated.status, DebtStatus.unpaid);
+    });
+  });
+
+  group('Schedule rewind preservation', () {
+    test('an unchanged schedule keeps the advanced next interest date',
+        () async {
+      await debtService.addDebt(
+        lenderName: 'Alice',
+        amount: 1000.0,
+        transactionDate: DateTime(2024, 1, 1),
+        interestRate: 5.0,
+        interestType: InterestType.simple,
+        interestMode: InterestMode.automatic,
+        interestFrequencyDays: 7,
+        interestStartDate: DateTime(2024, 2, 1),
+      );
+      final debt = (await debtService.getDebts()).first;
+      expect(debt.nextInterestDate, DateTime(2024, 2, 1));
+
+      // Simulate a catch-up run pushing the schedule forward, then edit
+      // only the name.
+      await debtService.updateDebt(
+        debt,
+        lenderName: 'Alice Smith',
+        amount: 1000.0,
+        transactionDate: DateTime(2024, 1, 1),
+        interestRate: 5.0,
+        interestType: InterestType.simple,
+        interestMode: InterestMode.automatic,
+        interestFrequencyDays: 7,
+        interestStartDate: DateTime(2024, 2, 1),
+        nextInterestDate: DateTime(2024, 3, 1),
+      );
+      await debtService.updateDebt(
+        (await debtService.getDebtById(debt.id!))!,
+        lenderName: 'Alice Smith II',
+        amount: 1000.0,
+        transactionDate: DateTime(2024, 1, 1),
+        interestRate: 5.0,
+        interestType: InterestType.simple,
+        interestMode: InterestMode.automatic,
+        interestFrequencyDays: 7,
+        interestStartDate: DateTime(2024, 2, 1),
+      );
+
+      final updated = (await debtService.getDebtById(debt.id!))!;
+      expect(updated.nextInterestDate, DateTime(2024, 3, 1));
+    });
+
+    test('changing start date or frequency restarts the schedule', () async {
+      await debtService.addDebt(
+        lenderName: 'Alice',
+        amount: 1000.0,
+        transactionDate: DateTime(2024, 1, 1),
+        interestRate: 5.0,
+        interestType: InterestType.simple,
+        interestMode: InterestMode.automatic,
+        interestFrequencyDays: 7,
+        interestStartDate: DateTime(2024, 2, 1),
+      );
+      final debt = (await debtService.getDebts()).first;
+      await debtService.updateDebt(
+        debt,
+        lenderName: 'Alice',
+        amount: 1000.0,
+        transactionDate: DateTime(2024, 1, 1),
+        interestRate: 5.0,
+        interestType: InterestType.simple,
+        interestMode: InterestMode.automatic,
+        interestFrequencyDays: 7,
+        interestStartDate: DateTime(2024, 2, 1),
+        nextInterestDate: DateTime(2024, 3, 1),
+      );
+
+      await debtService.updateDebt(
+        (await debtService.getDebtById(debt.id!))!,
+        lenderName: 'Alice',
+        amount: 1000.0,
+        transactionDate: DateTime(2024, 1, 1),
+        interestRate: 5.0,
+        interestType: InterestType.simple,
+        interestMode: InterestMode.automatic,
+        interestFrequencyDays: 10,
+        interestStartDate: DateTime(2024, 2, 1),
+      );
+
+      final updated = (await debtService.getDebtById(debt.id!))!;
+      expect(updated.nextInterestDate, DateTime(2024, 2, 1));
+    });
+  });
+
+  group('Reminder schedule on edit', () {
+    test('changed reminder settings reset the next reminder date', () async {
+      await debtService.addDebt(
+        lenderName: 'Alice',
+        amount: 100.0,
+        transactionDate: DateTime(2024, 1, 1),
+        reminderStartDate: DateTime(2024, 2, 1),
+      );
+      final debt = (await debtService.getDebts()).first;
+      expect(debt.nextReminderDate, DateTime(2024, 2, 1));
+
+      await debtService.updateDebt(
+        debt,
+        lenderName: 'Alice',
+        amount: 100.0,
+        transactionDate: DateTime(2024, 1, 1),
+        reminderStartDate: DateTime(2024, 3, 1),
+        reminderIntervalDays: 7,
+      );
+
+      final updated = (await debtService.getDebts()).first;
+      expect(updated.nextReminderDate, DateTime(2024, 3, 1));
+    });
+
+    test('an unchanged schedule preserves its next reminder date', () async {
+      await debtService.addDebt(
+        lenderName: 'Alice',
+        amount: 100.0,
+        transactionDate: DateTime(2024, 1, 1),
+        reminderStartDate: DateTime(2024, 2, 1),
+      );
+      final debt = (await debtService.getDebts()).first;
+
+      await debtService.updateDebt(
+        debt,
+        lenderName: 'Alice',
+        amount: 100.0,
+        transactionDate: DateTime(2024, 1, 1),
+        reminderStartDate: DateTime(2024, 2, 1),
+        nextReminderDate: DateTime(2024, 2, 5),
+      );
+      await debtService.updateDebt(
+        (await debtService.getDebts()).first,
+        lenderName: 'Alice II',
+        amount: 100.0,
+        transactionDate: DateTime(2024, 1, 1),
+        reminderStartDate: DateTime(2024, 2, 1),
+      );
+
+      final updated = (await debtService.getDebts()).first;
+      expect(updated.nextReminderDate, DateTime(2024, 2, 5));
     });
   });
 
@@ -423,6 +694,57 @@ void main() {
 
       final history = await debtService.getInterestHistory(debt.id!);
       expect(history.length, 2);
+    });
+  });
+
+  group('Automatic catch-up dedup', () {
+    test('already-recorded due date is skipped, not re-accrued', () async {
+      final now = DateTime.now();
+      final start = DateTime(now.year, now.month, now.day)
+          .subtract(const Duration(days: 20));
+      await debtService.addDebt(
+        lenderName: 'Alice',
+        amount: 1000.0,
+        transactionDate: start,
+        interestRate: 5.0,
+        interestType: InterestType.simple,
+        interestMode: InterestMode.automatic,
+        interestFrequencyDays: 7,
+        interestStartDate: start,
+      );
+      final debt = (await debtService.getDebts()).first;
+      await mockRepo.insertInterestTransaction(InterestTransaction(
+        debtId: debt.id!,
+        appliedAt: start,
+        interestRate: 5.0,
+        interestAmount: 50.0,
+        balanceBefore: 1000.0,
+        balanceAfter: 1050.0,
+        type: 'automatic',
+      ));
+      // The seeded history row is consistent with the balance: that first
+      // period was already applied AND counted.
+      final seeded = debt.copyWith(remainingBalance: 1050.0);
+      await mockRepo.updateDebt(seeded);
+
+      final applied = await interestService.processMissedInterest(seeded);
+
+      final fresh = (await debtService.getDebtById(debt.id!))!;
+      final history = await mockRepo.getInterestTransactionsByDebtId(debt.id!);
+      final recordCount = history.fold<double>(0, (s, t) => s + t.interestAmount);
+
+      expect(applied, recordCount - 50.0);
+      expect(fresh.remainingBalance, 1000.0 + recordCount);
+      expect(
+        history.map((t) => t.appliedAt).toSet().length,
+        history.length,
+      );
+
+      final again = await interestService.processMissedInterest(fresh);
+      expect(again, 0.0);
+
+      final after = (await debtService.getDebtById(fresh.id!))!;
+      expect(after.nextInterestDate!.isAfter(DateTime.now()), true);
     });
   });
 }

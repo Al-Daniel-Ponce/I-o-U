@@ -44,7 +44,6 @@ class InterestService {
       balanceAfter: balanceAfter,
       type: 'manual',
     );
-    await _repository.insertInterestTransaction(transaction);
 
     // Calculate next interest date for automatic debts
     DateTime? nextDate;
@@ -64,7 +63,10 @@ class InterestService {
       remainingBalance: balanceAfter,
       nextInterestDate: nextDate,
     );
-    await _repository.updateDebt(updated);
+    await _repository.applyInterestAtomic(
+      updatedDebt: updated,
+      transactions: [transaction],
+    );
 
     _logger.info(
         'Applied ${type.name} interest: $interestAmount on debt ${debt.id}');
@@ -106,27 +108,35 @@ class InterestService {
     final type = debt.interestType ?? InterestType.simple;
     final rate = debt.interestRate!;
 
+    // Dates that already carry a history row: when one exists for a due
+    // date the interest was already counted once, so the accrual itself
+    // must be skipped - not just the row insert.
+    final appliedDates =
+        (await _repository.getAppliedInterestDates(debt.id!)).toSet();
+
+    final transactions = <InterestTransaction>[];
+
     for (var i = 0; i < missed; i++) {
       if (currentBalance <= 0) break;
 
-      final interestAmount = InterestCalculator.calculate(
-        type: type,
-        rate: rate,
-        originalAmount: debt.amount,
-        currentBalance: currentBalance,
-      );
-
-      if (interestAmount <= 0) break;
-
-      final balanceBefore = currentBalance;
-      currentBalance += interestAmount;
-      totalInterest += interestAmount;
-
-      // Check for duplicate: skip if we already recorded interest on this date
-      final alreadyRecorded =
-          await _repository.hasInterestTransactionOnDate(debt.id!, currentDate);
+      final dueDate =
+          DateTime(currentDate.year, currentDate.month, currentDate.day);
+      final alreadyRecorded = appliedDates.contains(dueDate);
       if (!alreadyRecorded) {
-        final transaction = InterestTransaction(
+        final interestAmount = InterestCalculator.calculate(
+          type: type,
+          rate: rate,
+          originalAmount: debt.amount,
+          currentBalance: currentBalance,
+        );
+
+        if (interestAmount <= 0) break;
+
+        final balanceBefore = currentBalance;
+        currentBalance += interestAmount;
+        totalInterest += interestAmount;
+
+        transactions.add(InterestTransaction(
           debtId: debt.id!,
           appliedAt: currentDate,
           interestRate: rate,
@@ -134,8 +144,7 @@ class InterestService {
           balanceBefore: balanceBefore,
           balanceAfter: currentBalance,
           type: 'automatic',
-        );
-        await _repository.insertInterestTransaction(transaction);
+        ));
       }
 
       // Advance to next period
@@ -146,21 +155,25 @@ class InterestService {
       );
     }
 
-    if (totalInterest > 0) {
-      // Calculate the final next date after all catch-up periods
-      final finalNextDate = InterestCalculator.calculateNextDate(
-        startDate: debt.interestStartDate!,
-        frequencyDays: debt.interestFrequencyDays!,
-        fromDate: now,
-        currentNextDate: currentDate,
-      );
+    // Always persist the schedule advance even when every examined date was
+    // already recorded, otherwise the same catch-up window re-processes
+    // forever. Freshly calculated amounts and rows go out in one atomic
+    // batch with the balance so a crash cannot half-apply.
+    final finalNextDate = InterestCalculator.calculateNextDate(
+      startDate: debt.interestStartDate!,
+      frequencyDays: debt.interestFrequencyDays!,
+      fromDate: now,
+      currentNextDate: currentDate,
+    );
 
-      final updated = debt.copyWith(
-        remainingBalance: currentBalance,
-        nextInterestDate: finalNextDate,
-      );
-      await _repository.updateDebt(updated);
-    }
+    final updated = debt.copyWith(
+      remainingBalance: currentBalance,
+      nextInterestDate: finalNextDate,
+    );
+    await _repository.applyInterestAtomic(
+      updatedDebt: updated,
+      transactions: transactions,
+    );
 
     return totalInterest;
   }

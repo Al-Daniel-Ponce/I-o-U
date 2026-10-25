@@ -17,7 +17,12 @@ class DebtService {
             notificationService ?? NotificationService(),
         _logger = logger ?? const Logger('DebtService');
 
-  Future<void> addDebt({
+  /// Saves a new debt and schedules its reminder when enabled.
+  ///
+  /// Returns the persisted [Debt] (with its database id) so callers — e.g.
+  /// the QR sharing screen — can act on the saved record. Throws the
+  /// underlying repository error if persistence fails.
+  Future<Debt> addDebt({
     required String lenderName,
     required double amount,
     required DateTime transactionDate,
@@ -66,12 +71,14 @@ class DebtService {
         nextReminderDate: nextReminderDate,
       );
       final id = await _repository.insertDebt(debt);
+      final savedDebt = debt.copyWith(id: id);
 
       // Schedule reminder if enabled
       if (reminderEnabled) {
-        final savedDebt = debt.copyWith(id: id);
         await _notificationService.scheduleDebtReminder(savedDebt);
       }
+
+      return savedDebt;
     } catch (e, stack) {
       _logger.error('Failed to add debt', e, stack);
       rethrow;
@@ -135,13 +142,23 @@ class DebtService {
 
       final hasInterest = interestRate != null && interestRate > 0;
 
-      // If interest mode changed to automatic, recalculate next date
+      // Preserve the running automatic-interest schedule. Resetting the next
+      // due date to [interestStartDate] on every edit re-applied all past
+      // cycles on the next catch-up run, so the schedule only restarts when
+      // the user actually changes start date or frequency.
       DateTime? finalNextDate = nextInterestDate;
       if (hasInterest &&
           interestMode == InterestMode.automatic &&
           interestStartDate != null &&
           interestFrequencyDays != null) {
-        finalNextDate = interestStartDate;
+        final scheduleChanged =
+            interestStartDate != existing.interestStartDate ||
+                interestFrequencyDays != existing.interestFrequencyDays;
+        if (scheduleChanged) {
+          finalNextDate = interestStartDate;
+        } else if (nextInterestDate == null) {
+          finalNextDate = existing.nextInterestDate ?? interestStartDate;
+        }
       }
 
       // Handle reminder settings
@@ -151,8 +168,31 @@ class DebtService {
           reminderStartDate ?? existing.reminderStartDate;
       final int finalReminderIntervalDays =
           reminderIntervalDays ?? existing.reminderIntervalDays;
-      final DateTime? finalNextReminderDate =
-          nextReminderDate ?? existing.nextReminderDate;
+      // A changed reminder schedule must not keep the old due date, or the
+      // first notification still fires on the stale schedule.
+      final bool reminderScheduleChanged =
+          finalReminderStartDate != existing.reminderStartDate ||
+              finalReminderIntervalDays != existing.reminderIntervalDays;
+      final DateTime? finalNextReminderDate = reminderScheduleChanged
+          ? finalReminderStartDate
+          : (nextReminderDate ?? existing.nextReminderDate);
+
+      // Reconcile the balance with an amount change: a correction cancels
+      // part of what is still owed, never the progress already paid.
+      final amountChanged = amount != existing.amount;
+      double finalRemainingBalance = existing.remainingBalance;
+      DebtStatus finalStatus = existing.status;
+      if (amountChanged) {
+        finalRemainingBalance = (finalRemainingBalance + (amount - existing.amount))
+            .clamp(0.0, amount);
+        if (finalRemainingBalance <= 0) {
+          finalStatus = DebtStatus.paid;
+        } else if (finalRemainingBalance < amount) {
+          finalStatus = DebtStatus.partial;
+        } else {
+          finalStatus = DebtStatus.unpaid;
+        }
+      }
 
       updated = Debt(
         id: existing.id,
@@ -160,8 +200,8 @@ class DebtService {
         amount: amount,
         transactionDate: transactionDate,
         notes: notes?.trim().isEmpty == true ? null : notes?.trim(),
-        status: existing.status,
-        remainingBalance: existing.remainingBalance,
+        status: finalStatus,
+        remainingBalance: finalRemainingBalance,
         createdAt: existing.createdAt,
         interestRate: hasInterest ? interestRate : null,
         interestType: hasInterest ? interestType : null,
@@ -247,13 +287,22 @@ class DebtService {
     String? note,
   }) async {
     try {
+      if (debt.id == null) {
+        throw ArgumentError('Cannot record a payment on an unsaved debt.');
+      }
+      if (amount <= 0) {
+        throw ArgumentError('Payment amount must be positive.');
+      }
+      if (amount > debt.remainingBalance + 0.001) {
+        throw ArgumentError('Payment exceeds the remaining balance.');
+      }
+
       final payment = PaymentHistory(
         debtId: debt.id!,
         paymentAmount: amount,
         paymentDate: DateTime.now(),
         paymentNote: note?.trim().isEmpty == true ? null : note?.trim(),
       );
-      await _repository.insertPayment(payment);
 
       final newRemaining =
           (debt.remainingBalance - amount).clamp(0.0, double.infinity);
@@ -264,7 +313,12 @@ class DebtService {
         status: newStatus,
         remainingBalance: newRemaining,
       );
-      await _repository.updateDebt(updatedDebt);
+      // Persist the payment row and the resulting balance atomically so a
+      // crash can never leave one without the other.
+      await _repository.recordPaymentAtomic(
+        payment: payment,
+        updatedDebt: updatedDebt,
+      );
 
       // Cancel reminder if debt is fully paid
       if (newStatus == DebtStatus.paid) {

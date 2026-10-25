@@ -64,7 +64,12 @@ class SettingsRepositoryImpl implements ISettingsRepository {
   Future<void> saveSecurityAnswer(SecurityAnswer answer) async {
     final db = await _db;
     final rows = await db.query('app_settings', limit: 1);
-    if (rows.isEmpty) return;
+    if (rows.isEmpty) {
+      // The settings row is created by setPin() during first-run setup; if
+      // it is missing something is broken. Fail loudly instead of silently
+      // dropping the answer and breaking offline recovery later.
+      throw StateError('app_settings row missing; cannot save the answer.');
+    }
     await db.update(
       'app_settings',
       {
@@ -90,9 +95,15 @@ class SettingsRepositoryImpl implements ISettingsRepository {
   @override
   Future<void> wipeAllData() async {
     final db = await _db;
-    await db.delete('payment_history');
-    await db.delete('debts');
-    await db.delete('app_settings');
+    // One transaction: a mid-wipe crash must leave either all data or none,
+    // never a half-wiped mix of debts and credentials.
+    await db.transaction((txn) async {
+      await txn.delete('payment_history');
+      await txn.delete('debts');
+      await txn.delete('interest_history');
+      await txn.delete('received_debts');
+      await txn.delete('app_settings');
+    });
     await _dbHelper.close();
   }
 }

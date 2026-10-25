@@ -17,7 +17,7 @@ class DatabaseHelper {
     return _database!;
   }
 
-  static const _dbVersion = 5;
+  static const _dbVersion = 7;
 
   Future<Database> _initDB(String fileName) async {
     final dbPath = await getDatabasesPath();
@@ -25,9 +25,16 @@ class DatabaseHelper {
     return openDatabase(
       path,
       version: _dbVersion,
+      onConfigure: _onConfigure,
       onCreate: _createSchema,
       onUpgrade: _onUpgrade,
     );
+  }
+
+  /// SQLite ships with foreign-key enforcement OFF, which leaves the
+  /// declared ON DELETE CASCADE rules dead. Turn it on for the connection.
+  Future<void> _onConfigure(Database db) async {
+    await db.execute('PRAGMA foreign_keys = ON');
   }
 
   Future<void> _createSchema(Database db, int version) async {
@@ -56,7 +63,11 @@ class DatabaseHelper {
         interest_mode            TEXT,
         interest_frequency_days  INTEGER,
         interest_start_date      TEXT,
-        next_interest_date       TEXT
+        next_interest_date       TEXT,
+        reminder_enabled         INTEGER DEFAULT 1,
+        reminder_start_date      TEXT,
+        reminder_interval_days   INTEGER DEFAULT 1,
+        next_reminder_date       TEXT
       )
     ''');
 
@@ -84,6 +95,36 @@ class DatabaseHelper {
         FOREIGN KEY (debt_id) REFERENCES debts (id) ON DELETE CASCADE
       )
     ''');
+
+    await _createReceivedDebts(db);
+  }
+
+  /// Read-only copies of debts received by scanning a lender's QR code.
+  ///
+  /// Kept out of `debts` on purpose: every scheduler (interest, reminders)
+  /// iterates `debts`, and a borrowed record must never accrue interest,
+  /// fire "you are owed" reminders, or accept payments.
+  Future<void> _createReceivedDebts(Database db) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS received_debts (
+        id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+        record_uid              TEXT    NOT NULL UNIQUE,
+        lender_name             TEXT    NOT NULL,
+        borrower_name           TEXT,
+        amount                  REAL    NOT NULL,
+        remaining_balance       REAL    NOT NULL,
+        transaction_date        TEXT    NOT NULL,
+        notes                   TEXT,
+        status                  TEXT    NOT NULL DEFAULT 'unpaid',
+        interest_rate           REAL,
+        interest_type           TEXT,
+        interest_mode           TEXT,
+        interest_frequency_days INTEGER,
+        interest_start_date     TEXT,
+        created_at              TEXT    NOT NULL,
+        received_at             TEXT    NOT NULL
+      )
+    ''');
   }
 
   Future<Set<String>> _existingColumns(Database db, String table) async {
@@ -104,6 +145,19 @@ class DatabaseHelper {
   }
 
   Future<void> _onUpgrade(Database db, int oldVersion, int newVersion) async {
+    // Migrations may touch legacy data that predates foreign-key cleanup
+    // (orphan history rows from the pre-transaction delete path). Keep FK
+    // enforcement suspended for the window so a dirty legacy table can
+    // never brick openDatabase; _onConfigure re-arms it on the next open.
+    await db.execute('PRAGMA foreign_keys = OFF');
+    try {
+      await _runMigrations(db, oldVersion);
+    } finally {
+      await db.execute('PRAGMA foreign_keys = ON');
+    }
+  }
+
+  Future<void> _runMigrations(Database db, int oldVersion) async {
     if (oldVersion < 2) {
       await _addColumnIfMissing(db, 'app_settings', 'security_q_id', 'TEXT');
       await _addColumnIfMissing(db, 'app_settings', 'security_answer', 'TEXT');
@@ -121,15 +175,21 @@ class DatabaseHelper {
       await _addColumnIfMissing(db, 'debts', 'interest_start_date', 'TEXT');
       await _addColumnIfMissing(db, 'debts', 'next_interest_date', 'TEXT');
 
-      // Migrate existing debts: if interest_rate is set, default to simple/manual
-      await db.rawUpdate('''
-        UPDATE debts
-        SET interest_type = 'simple',
-            interest_mode = 'manual',
-            next_interest_date = interest_date
-        WHERE interest_rate IS NOT NULL AND interest_rate > 0
-          AND interest_type IS NULL
-      ''');
+      // Migrate existing debts: if interest_rate is set, default to simple/manual.
+      // interest_date was only added by the v3 step; a database scaffolded
+      // fresh at v3 never had it, so guard the reference or openDatabase
+      // would throw "no such column" on every launch.
+      final columns = await _existingColumns(db, 'debts');
+      if (columns.contains('interest_date')) {
+        await db.rawUpdate('''
+          UPDATE debts
+          SET interest_type = 'simple',
+              interest_mode = 'manual',
+              next_interest_date = interest_date
+          WHERE interest_rate IS NOT NULL AND interest_rate > 0
+            AND interest_type IS NULL
+        ''');
+      }
 
       // Create interest_history table
       await db.execute('''
@@ -179,6 +239,20 @@ class DatabaseHelper {
       await db.rawUpdate(
         "UPDATE debts SET reminder_enabled = 0 WHERE status = 'paid'",
       );
+    }
+    if (oldVersion < 6) {
+      await _createReceivedDebts(db);
+    }
+    if (oldVersion < 7) {
+      // Repairs databases created fresh at v5/v6 whose scaffolded debts
+      // table lacked the reminder columns (the ALTER TABLE migration at
+      // v5 only ever ran for databases upgrading from <= v4).
+      await _addColumnIfMissing(
+          db, 'debts', 'reminder_enabled', 'INTEGER DEFAULT 1');
+      await _addColumnIfMissing(db, 'debts', 'reminder_start_date', 'TEXT');
+      await _addColumnIfMissing(
+          db, 'debts', 'reminder_interval_days', 'INTEGER DEFAULT 1');
+      await _addColumnIfMissing(db, 'debts', 'next_reminder_date', 'TEXT');
     }
   }
 

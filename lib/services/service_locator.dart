@@ -1,11 +1,17 @@
+import 'package:shared_preferences/shared_preferences.dart';
+
 import '../repositories/database_helper.dart';
 import '../repositories/debt_repository_impl.dart';
+import '../repositories/received_debt_repository_impl.dart';
 import '../repositories/settings_repository_impl.dart';
 import 'auth_service.dart';
 import 'biometric_service.dart';
 import 'debt_service.dart';
 import 'interest_service.dart';
 import 'notification_service.dart';
+import 'profile_service.dart';
+import 'received_debt_service.dart';
+import 'role_service.dart';
 
 /// Lightweight service locator / dependency-injection container.
 ///
@@ -24,6 +30,9 @@ class ServiceLocator {
   static InterestService? _overriddenInterestService;
   static BiometricService? _overriddenBiometricService;
   static NotificationService? _overriddenNotificationService;
+  static RoleService? _overriddenRoleService;
+  static ReceivedDebtService? _overriddenReceivedDebtService;
+  static ProfileService? _overriddenProfileService;
 
   static final DebtRepositoryImpl _debtRepo =
       DebtRepositoryImpl(DatabaseHelper.instance);
@@ -32,11 +41,18 @@ class ServiceLocator {
   static final DebtService _defaultDebtService =
       DebtService(_debtRepo, _defaultInterestService,
           notificationService: _defaultNotificationService);
-  static final AuthService _defaultAuthService =
-      AuthService(SettingsRepositoryImpl(DatabaseHelper.instance));
+  static final AuthService _defaultAuthService = AuthService(
+    SettingsRepositoryImpl(DatabaseHelper.instance),
+    notificationService: _defaultNotificationService,
+  );
   static final BiometricService _defaultBiometricService = BiometricService();
   static final NotificationService _defaultNotificationService =
       NotificationService();
+  static const RoleService _defaultRoleService = RoleService();
+  static final ReceivedDebtService _defaultReceivedDebtService =
+      ReceivedDebtService(ReceivedDebtRepositoryImpl(DatabaseHelper.instance));
+  static final ProfileService _defaultProfileService =
+      ProfileService(SharedPreferences.getInstance());
 
   /// Override services for testing. Pass `null` to reset to defaults.
   static void configure({
@@ -45,12 +61,18 @@ class ServiceLocator {
     InterestService? interestService,
     BiometricService? biometricService,
     NotificationService? notificationService,
+    RoleService? roleService,
+    ReceivedDebtService? receivedDebtService,
+    ProfileService? profileService,
   }) {
     _overriddenDebtService = debtService;
     _overriddenAuthService = authService;
     _overriddenInterestService = interestService;
     _overriddenBiometricService = biometricService;
     _overriddenNotificationService = notificationService;
+    _overriddenRoleService = roleService;
+    _overriddenReceivedDebtService = receivedDebtService;
+    _overriddenProfileService = profileService;
   }
 
   DebtService get debtService =>
@@ -63,4 +85,10 @@ class ServiceLocator {
       _overriddenBiometricService ?? _defaultBiometricService;
   NotificationService get notificationService =>
       _overriddenNotificationService ?? _defaultNotificationService;
+  RoleService get roleService =>
+      _overriddenRoleService ?? _defaultRoleService;
+  ReceivedDebtService get receivedDebtService =>
+      _overriddenReceivedDebtService ?? _defaultReceivedDebtService;
+  ProfileService get profileService =>
+      _overriddenProfileService ?? _defaultProfileService;
 }

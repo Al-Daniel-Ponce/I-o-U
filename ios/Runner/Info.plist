@@ -45,6 +45,8 @@
 	<true/>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
+	<key>NSCameraUsageDescription</key>
+	<string>Scan a lender's QR code to receive the details of a debt they shared with you.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>fetch</string>
