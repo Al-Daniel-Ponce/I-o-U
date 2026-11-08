@@ -1,4 +1,5 @@
 import 'package:iou_debt_tracker/models/debt.dart';
+import 'package:iou_debt_tracker/models/received_debt.dart';
 import 'package:iou_debt_tracker/models/security_question.dart';
 import 'package:iou_debt_tracker/repositories/i_debt_repositories.dart';
 
@@ -38,6 +39,10 @@ class MockDebtRepository implements IDebtRepository {
       interestFrequencyDays: debt.interestFrequencyDays,
       interestStartDate: debt.interestStartDate,
       nextInterestDate: debt.nextInterestDate,
+      reminderEnabled: debt.reminderEnabled,
+      reminderStartDate: debt.reminderStartDate,
+      reminderIntervalDays: debt.reminderIntervalDays,
+      nextReminderDate: debt.nextReminderDate,
     ));
     return id;
   }
@@ -168,6 +173,54 @@ class MockDebtRepository implements IDebtRepository {
   }
 
   @override
+  Future<List<DateTime>> getAppliedInterestDates(int debtId) async {
+    return _interestTransactions
+        .where((t) => t.debtId == debtId)
+        .map((t) =>
+            DateTime(t.appliedAt.year, t.appliedAt.month, t.appliedAt.day))
+        .toList();
+  }
+
+  @override
+  Future<void> recordPaymentAtomic({
+    required PaymentHistory payment,
+    required Debt updatedDebt,
+  }) async {
+    final paymentId = _nextPaymentId++;
+    _payments.add(PaymentHistory(
+      id: paymentId,
+      debtId: payment.debtId,
+      paymentAmount: payment.paymentAmount,
+      paymentDate: payment.paymentDate,
+      paymentNote: payment.paymentNote,
+    ));
+    final idx = _debts.indexWhere((d) => d.id == updatedDebt.id);
+    if (idx != -1) _debts[idx] = updatedDebt;
+  }
+
+  @override
+  Future<void> applyInterestAtomic({
+    required Debt updatedDebt,
+    required List<InterestTransaction> transactions,
+  }) async {
+    for (final transaction in transactions) {
+      final interestId = _nextInterestId++;
+      _interestTransactions.add(InterestTransaction(
+        id: interestId,
+        debtId: transaction.debtId,
+        appliedAt: transaction.appliedAt,
+        interestRate: transaction.interestRate,
+        interestAmount: transaction.interestAmount,
+        balanceBefore: transaction.balanceBefore,
+        balanceAfter: transaction.balanceAfter,
+        type: transaction.type,
+      ));
+    }
+    final idx = _debts.indexWhere((d) => d.id == updatedDebt.id);
+    if (idx != -1) _debts[idx] = updatedDebt;
+  }
+
+  @override
   Future<DebtSummary> getSummary() async {
     double totalBorrowed = 0;
     double totalRemaining = 0;
@@ -254,5 +307,36 @@ class MockSettingsRepository implements ISettingsRepository {
   @override
   Future<void> wipeAllData() async {
     reset();
+  }
+}
+
+/// In-memory mock implementation of [IReceivedDebtRepository] for unit tests.
+class MockReceivedDebtRepository implements IReceivedDebtRepository {
+  final List<ReceivedDebt> _records = [];
+  int _nextId = 1;
+
+  void reset() {
+    _records.clear();
+    _nextId = 1;
+  }
+
+  @override
+  Future<({int id, bool inserted})> upsert(ReceivedDebt record) async {
+    final idx = _records.indexWhere((r) => r.recordUid == record.recordUid);
+    if (idx != -1) {
+      final id = _records[idx].id!;
+      _records[idx] = record.withId(id);
+      return (id: id, inserted: false);
+    }
+    final id = _nextId++;
+    _records.add(record.withId(id));
+    return (id: id, inserted: true);
+  }
+
+  @override
+  Future<List<ReceivedDebt>> getAll() async {
+    final results = List<ReceivedDebt>.from(_records);
+    results.sort((a, b) => b.receivedAt.compareTo(a.receivedAt));
+    return results;
   }
 }

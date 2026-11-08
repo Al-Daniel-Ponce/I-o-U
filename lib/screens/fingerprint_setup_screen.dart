@@ -5,7 +5,7 @@ import 'package:google_fonts/google_fonts.dart';
 
 import '../services/service_locator.dart';
 import '../theme/app_theme.dart';
-import 'dashboard_screen.dart';
+import 'after_auth_gate.dart';
 
 /// One-time fingerprint setup screen shown after PIN + security question.
 ///
@@ -50,7 +50,7 @@ class _FingerprintSetupScreenState extends State<FingerprintSetupScreen> {
 
     if (authenticated && mounted) {
       await ServiceLocator.instance.authService.setBiometricsEnabled(true);
-      _goToDashboard();
+      _finishSetup();
     } else if (mounted) {
       setState(() => _isAuthenticating = false);
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
@@ -63,11 +63,13 @@ class _FingerprintSetupScreenState extends State<FingerprintSetupScreen> {
     }
   }
 
-  void _goToDashboard() {
+  /// End of first-run setup — hands off to the post-auth route, which asks
+  /// for a role on first run and otherwise opens the saved role's dashboard.
+  void _finishSetup() {
     if (!mounted) return;
     Navigator.of(context).pushReplacement(
       PageRouteBuilder(
-        pageBuilder: (_, __, ___) => const DashboardScreen(),
+        pageBuilder: (_, __, ___) => const AfterAuthGate(),
         transitionsBuilder: (_, anim, __, child) =>
             FadeTransition(opacity: anim, child: child),
         transitionDuration: const Duration(milliseconds: 400),
@@ -102,10 +104,10 @@ class _FingerprintSetupScreenState extends State<FingerprintSetupScreen> {
                             width: 72,
                             height: 72,
                             decoration: BoxDecoration(
-                              color: AppTheme.accent.withOpacity(0.12),
+                              color: AppTheme.accent.withValues(alpha: 0.12),
                               borderRadius: BorderRadius.circular(20),
                               border: Border.all(
-                                  color: AppTheme.accent.withOpacity(0.4),
+                                  color: AppTheme.accent.withValues(alpha: 0.4),
                                   width: 1.5),
                             ),
                             child: Icon(
@@ -182,7 +184,7 @@ class _FingerprintSetupScreenState extends State<FingerprintSetupScreen> {
                       Container(
                         padding: const EdgeInsets.all(14),
                         decoration: BoxDecoration(
-                          color: AppTheme.surfaceLight.withOpacity(0.5),
+                          color: AppTheme.surfaceLight.withValues(alpha: 0.5),
                           borderRadius: BorderRadius.circular(12),
                         ),
                         child: Row(
@@ -205,10 +207,10 @@ class _FingerprintSetupScreenState extends State<FingerprintSetupScreen> {
                       Container(
                         padding: const EdgeInsets.all(16),
                         decoration: BoxDecoration(
-                          color: AppTheme.surfaceLight.withOpacity(0.5),
+                          color: AppTheme.surfaceLight.withValues(alpha: 0.5),
                           borderRadius: BorderRadius.circular(14),
                           border: Border.all(
-                              color: AppTheme.textMuted.withOpacity(0.2)),
+                              color: AppTheme.textMuted.withValues(alpha: 0.2)),
                         ),
                         child: Row(
                           children: [
@@ -233,7 +235,7 @@ class _FingerprintSetupScreenState extends State<FingerprintSetupScreen> {
                     SizedBox(
                       width: double.infinity,
                       child: TextButton(
-                        onPressed: _isAuthenticating ? null : _goToDashboard,
+                        onPressed: _isAuthenticating ? null : _finishSetup,
                         child: Text(
                           _hasFingerprint ? 'Skip for now' : 'Continue',
                           style: GoogleFonts.dmSans(

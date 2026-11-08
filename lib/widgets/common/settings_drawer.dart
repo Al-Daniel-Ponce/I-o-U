@@ -7,11 +7,12 @@ import 'package:google_fonts/google_fonts.dart';
 import '../../controllers/theme_controller.dart';
 import '../../screens/change_pin_screen.dart';
 import '../../screens/pin_screen.dart';
+import '../../screens/role_selection_screen.dart';
 import '../../services/service_locator.dart';
 import '../../theme/app_theme.dart';
 
-/// Side drawer containing app settings: theme toggle, PIN change,
-/// and a hidden developer option (go to lock screen).
+/// Side drawer containing app settings: theme toggle, PIN change, role
+/// switching, and a hidden developer option (go to lock screen).
 ///
 /// OOP principles:
 /// - Single Responsibility : only renders settings; logic is in controllers.
@@ -38,6 +39,9 @@ class _SettingsDrawerState extends State<SettingsDrawer>
   bool _hasFingerprint = false;
   bool _biometricsLoading = true;
 
+  // ── Profile name (used as "Lent by …" on shared debts) ─────────────────────
+  String _profileName = '';
+
   // Countdown toast animation
   late final AnimationController _toastCtrl;
   late final Animation<double> _toastFade;
@@ -47,6 +51,7 @@ class _SettingsDrawerState extends State<SettingsDrawer>
     super.initState();
     ThemeController.instance.addListener(_onThemeChange);
     _loadBiometricsState();
+    _loadProfileName();
 
     _toastCtrl = AnimationController(
       vsync: this,
@@ -72,6 +77,23 @@ class _SettingsDrawerState extends State<SettingsDrawer>
   }
 
   void _onThemeChange() => setState(() {});
+
+  Future<void> _loadProfileName() async {
+    final name = await ServiceLocator.instance.profileService.getName();
+    if (mounted) setState(() => _profileName = name);
+  }
+
+  /// Edit the shared profile name shown on QR codes and borrower copies.
+  Future<void> _editProfileName() async {
+    final result = await showDialog<String>(
+      context: context,
+      builder: (_) => _NameDialog(initialName: _profileName),
+    );
+    if (result == null) return;
+
+    await ServiceLocator.instance.profileService.setName(result);
+    if (mounted) setState(() => _profileName = result);
+  }
 
   @override
   void dispose() {
@@ -119,6 +141,27 @@ class _SettingsDrawerState extends State<SettingsDrawer>
     );
   }
 
+  // ── Role switching ─────────────────────────────────────────────────────────
+
+  /// Returns to the role picker, leaving the saved role in place so the
+  /// picker can mark it as "Current".
+  ///
+  /// The navigator is captured before the push because the drawer is
+  /// disposed as soon as its route is removed, exactly as in [_wipeAllData].
+  void _switchRole() {
+    final nav = Navigator.of(context);
+
+    nav.pushAndRemoveUntil(
+      PageRouteBuilder(
+        pageBuilder: (_, __, ___) => const RoleSelectionScreen(),
+        transitionsBuilder: (_, anim, __, child) =>
+            FadeTransition(opacity: anim, child: child),
+        transitionDuration: const Duration(milliseconds: 400),
+      ),
+      (route) => false, // clear entire stack → fresh picker
+    );
+  }
+
   // ── Biometrics toggle ─────────────────────────────────────────────────────
 
   Future<void> _onBiometricsToggle(bool value) async {
@@ -158,7 +201,13 @@ class _SettingsDrawerState extends State<SettingsDrawer>
     // Step 2: wipe every table and reset the DB connection.
     await ServiceLocator.instance.authService.wipeAllData();
 
-    // Step 3: use the captured navigator to clear the entire stack and push
+    // Step 3: forget the chosen role too, so the next unlock re-asks.
+    await ServiceLocator.instance.roleService.clearRole();
+
+    // Step 3b: forget the profile name used on shared debt codes.
+    await ServiceLocator.instance.profileService.setName('');
+
+    // Step 4: use the captured navigator to clear the entire stack and push
     // the fresh PIN setup screen.  This also implicitly closes the drawer
     // because it removes all routes beneath it.
     nav.pushAndRemoveUntil(
@@ -249,6 +298,38 @@ class _SettingsDrawerState extends State<SettingsDrawer>
                 Navigator.push(context,
                     MaterialPageRoute(builder: (_) => const ChangePinScreen()));
               },
+            ),
+
+            const SizedBox(height: 6),
+
+            // ── Your name (identity on shared debts) ────────────────────
+            _SettingsTile(
+              icon: Icons.badge_rounded,
+              iconColor: AppTheme.accent,
+              label: 'Your Name',
+              subtitle: _profileName.isEmpty ? 'Not set yet' : _profileName,
+              cardBg: cardBg,
+              textPrimary: textPrimary,
+              textMuted: textMuted,
+              trailing: Icon(Icons.arrow_forward_ios_rounded,
+                  size: 14, color: textMuted),
+              onTap: _editProfileName,
+            ),
+
+            const SizedBox(height: 6),
+
+            // ── Switch Role ─────────────────────────────────────────────
+            _SettingsTile(
+              icon: Icons.swap_horiz_rounded,
+              iconColor: AppTheme.primaryLight,
+              label: 'Switch Role',
+              subtitle: 'Lender ↔ Borrower',
+              cardBg: cardBg,
+              textPrimary: textPrimary,
+              textMuted: textMuted,
+              trailing: Icon(Icons.arrow_forward_ios_rounded,
+                  size: 14, color: textMuted),
+              onTap: _switchRole,
             ),
 
             const SizedBox(height: 6),
@@ -811,6 +892,75 @@ class _WipeConfirmDialogState extends State<_WipeConfirmDialog> {
             child: Text('Wipe Everything',
                 style: GoogleFonts.dmSans(fontWeight: FontWeight.w700)),
           ),
+        ),
+      ],
+    );
+  }
+}
+
+/// Asks for the shared profile name.
+///
+/// Owns its [TextEditingController] so the field is not disposed while the
+/// dialog's exit transition is still animating it (disposing it right after
+/// `showDialog` returns crashes with "used after being disposed").
+class _NameDialog extends StatefulWidget {
+  final String initialName;
+
+  const _NameDialog({required this.initialName});
+
+  @override
+  State<_NameDialog> createState() => _NameDialogState();
+}
+
+class _NameDialogState extends State<_NameDialog> {
+  late final TextEditingController _controller =
+      TextEditingController(text: widget.initialName);
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      backgroundColor:
+          ThemeController.instance.isDark ? AppTheme.cardBg : AppTheme.lSurface,
+      title: Text(
+        'Your name',
+        style: GoogleFonts.spaceGrotesk(color: AppTheme.textPrimary),
+      ),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          TextField(
+            controller: _controller,
+            autofocus: true,
+            textCapitalization: TextCapitalization.words,
+            decoration: const InputDecoration(hintText: 'e.g. Marco'),
+            onSubmitted: (value) => Navigator.pop(context, value.trim()),
+          ),
+          const SizedBox(height: 10),
+          Text(
+            'Shown as "Lent by …" on the QR you share.',
+            style: GoogleFonts.dmSans(
+              color: AppTheme.textMuted,
+              fontSize: 12,
+            ),
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: Text('Cancel',
+              style: GoogleFonts.dmSans(color: AppTheme.textMuted)),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.pop(context, _controller.text.trim()),
+          child: Text('Save', style: GoogleFonts.dmSans()),
         ),
       ],
     );

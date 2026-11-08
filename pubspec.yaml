@@ -21,6 +21,10 @@ dependencies:
   local_auth: ^2.3.0
   flutter_local_notifications: ^17.0.0
   timezone: ^0.9.2
+  qr_flutter: ^4.1.0
+  mobile_scanner: ^7.4.2
+  share_plus: ^13.3.1
+  flutter_timezone: ^5.1.0
 
 dev_dependencies:
   flutter_test:
@@ -28,6 +32,8 @@ dev_dependencies:
   flutter_lints: ^3.0.0
   mockito: ^5.4.4
   build_runner: ^2.4.8
+  share_plus_platform_interface: ^7.2.0
+  sqflite_common_ffi: ^2.4.0
 
 flutter:
   uses-material-design: true

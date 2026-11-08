@@ -119,7 +119,7 @@ class DebtCard extends StatelessWidget {
         StatusBadge(status: debt.status, compact: true),
         if (debt.reminderEnabled && !debt.isPaid) ...[
           const SizedBox(width: 6),
-          Icon(
+          const Icon(
             Icons.notifications_active_rounded,
             size: 12,
             color: AppTheme.success,

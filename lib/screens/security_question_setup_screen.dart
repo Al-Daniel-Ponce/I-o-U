@@ -44,22 +44,31 @@ class _SecurityQuestionSetupScreenState
     if (!_formKey.currentState!.validate()) return;
 
     setState(() => _isSaving = true);
-    await ServiceLocator.instance.authService.saveSecurityAnswer(
-      questionId: _selectedQuestion!.id,
-      answer: _answerController.text,
-    );
+    try {
+      await ServiceLocator.instance.authService.saveSecurityAnswer(
+        questionId: _selectedQuestion!.id,
+        answer: _answerController.text,
+      );
+    } catch (e) {
+      // A failed save must reset the button and say so — staying on this
+      // screen is what keeps offline recovery question working.
+      if (mounted) {
+        setState(() => _isSaving = false);
+        _showError('Could not save your answer. Please try again.');
+      }
+      return;
+    }
+    if (!mounted) return;
     setState(() => _isSaving = false);
 
-    if (mounted) {
-      Navigator.of(context).pushReplacement(
-        PageRouteBuilder(
-          pageBuilder: (_, __, ___) => const FingerprintSetupScreen(),
-          transitionsBuilder: (_, anim, __, child) =>
-              FadeTransition(opacity: anim, child: child),
-          transitionDuration: const Duration(milliseconds: 400),
-        ),
-      );
-    }
+    Navigator.of(context).pushReplacement(
+      PageRouteBuilder(
+        pageBuilder: (_, __, ___) => const FingerprintSetupScreen(),
+        transitionsBuilder: (_, anim, __, child) =>
+            FadeTransition(opacity: anim, child: child),
+        transitionDuration: const Duration(milliseconds: 400),
+      ),
+    );
   }
 
   void _showError(String msg) {

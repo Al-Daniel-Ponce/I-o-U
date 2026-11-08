@@ -1,18 +1,23 @@
 // ignore_for_file: deprecated_member_use
 
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 
 import '../services/service_locator.dart';
 import '../theme/app_theme.dart';
-import 'dashboard_screen.dart';
+import 'after_auth_gate.dart';
 import 'recovery_screen.dart';
 import 'security_question_setup_screen.dart';
 
 /// PIN entry / setup screen.
 ///
 /// Setup flow : Create PIN → Confirm PIN → Security Question Setup.
-/// Login flow : Enter PIN → Dashboard (with Forgot PIN? link).
+/// Login flow : Enter PIN → Role selection / Dashboard (with Forgot PIN? link).
+///
+/// Login brute-force is throttled with persisted counters: 5 failures →
+/// 30 s lockout, 10 failures → 60 s lockout. Counters survive app restarts.
 class PinScreen extends StatefulWidget {
   final bool isSetup;
   const PinScreen({super.key, required this.isSetup});
@@ -28,6 +33,16 @@ class _PinScreenState extends State<PinScreen>
   bool _isConfirming = false;
   String _errorMessage = '';
 
+  // ── Login lockout state ────────────────────────────────────────────────────
+  static const int _tier1Attempts = 5; // → 30 s lockout
+  static const int _tier2Attempts = 10; // → 60 s lockout
+  static const int _tier1Seconds = 30;
+  static const int _tier2Seconds = 60;
+  int _failedAttempts = 0;
+  bool _isLocked = false;
+  int _secondsRemaining = 0;
+  Timer? _lockTimer;
+
   late final AnimationController _shakeController;
   late final Animation<double> _shakeAnimation;
 
@@ -41,24 +56,62 @@ class _PinScreenState extends State<PinScreen>
     _shakeAnimation = Tween<double>(begin: 0, end: 1).animate(
       CurvedAnimation(parent: _shakeController, curve: Curves.elasticOut),
     );
+    _loadLockState();
   }
 
   @override
   void dispose() {
     _shakeController.dispose();
+    _lockTimer?.cancel();
     super.dispose();
+  }
+
+  /// Restores any lockout persisted before the last process death so an
+  /// attacker cannot reset the brake by restarting the app.
+  Future<void> _loadLockState() async {
+    if (widget.isSetup) return;
+    final authService = ServiceLocator.instance.authService;
+    _failedAttempts = await authService.failedAttempts(recovery: false);
+    final remaining = await authService.lockRemaining(recovery: false);
+    if (!mounted || remaining == null) return;
+    _applyLock(remaining.inSeconds < 1 ? 1 : remaining.inSeconds);
+  }
+
+  void _applyLock(int seconds) {
+    _lockTimer?.cancel();
+    setState(() {
+      _isLocked = true;
+      _secondsRemaining = seconds;
+      _errorMessage =
+          'Too many failed attempts. Try again in $seconds second${seconds == 1 ? '' : 's'}.';
+    });
+    _lockTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (!mounted) { timer.cancel(); return; }
+      if (_secondsRemaining <= 1) {
+        timer.cancel();
+        setState(() {
+          _isLocked = false;
+          _secondsRemaining = 0;
+          _errorMessage = '';
+        });
+        ServiceLocator.instance.authService
+            .lockUntil(recovery: false, until: null);
+        return;
+      }
+      setState(() => _secondsRemaining--);
+    });
   }
 
   // ── Input ──────────────────────────────────────────────────────────────────
 
   void _onDigitPressed(String digit) {
-    if (_pin.length >= 4) return;
+    if (_isLocked || _pin.length >= 4) return;
     setState(() { _pin += digit; _errorMessage = ''; });
     if (_pin.length == 4) _handlePinComplete();
   }
 
   void _onBackspace() {
-    if (_pin.isEmpty) return;
+    if (_isLocked || _pin.isEmpty) return;
     setState(() {
       _pin = _pin.substring(0, _pin.length - 1);
       _errorMessage = '';
@@ -67,6 +120,7 @@ class _PinScreenState extends State<PinScreen>
 
   Future<void> _handlePinComplete() async {
     await Future.delayed(const Duration(milliseconds: 150));
+    if (!mounted || _isLocked) return;
     if (widget.isSetup) {
       await _handleSetup();
     } else {
@@ -102,13 +156,40 @@ class _PinScreenState extends State<PinScreen>
   // ── Login flow ─────────────────────────────────────────────────────────────
 
   Future<void> _handleLogin() async {
-    final valid =
-        await ServiceLocator.instance.authService.authenticate(_pin);
+    if (_isLocked) return;
+    final authService = ServiceLocator.instance.authService;
+    final valid = await authService.authenticate(_pin);
+    if (!mounted) return;
+
     if (valid) {
-      _navigateToDashboard();
-    } else {
-      _shake('Incorrect PIN. Please try again.');
+      await authService.resetFailedAttempts(recovery: false);
+      await authService.lockUntil(recovery: false, until: null);
+      if (!mounted) return;
+      _navigateAfterAuth();
+      return;
     }
+
+    _failedAttempts = await authService.recordFailedAttempt(recovery: false);
+    if (!mounted) return;
+
+    final tier1Hit = _failedAttempts >= _tier1Attempts;
+    final tier2Hit = _failedAttempts >= _tier2Attempts;
+    if (!tier1Hit) {
+      final left = _tier1Attempts - _failedAttempts;
+      _shake(
+          'Incorrect PIN. Please try again. ($left attempt${left == 1 ? '' : 's'} left before lockout)');
+      return;
+    }
+
+    final lockSeconds = tier2Hit ? _tier2Seconds : _tier1Seconds;
+    await authService.lockUntil(
+      recovery: false,
+      until: DateTime.now().add(Duration(seconds: lockSeconds)),
+    );
+    if (!mounted) return;
+    _applyLock(lockSeconds);
+    _shakeController.forward(from: 0);
+    setState(() => _pin = '');
   }
 
   void _shake(String message) {
@@ -116,10 +197,12 @@ class _PinScreenState extends State<PinScreen>
     setState(() { _errorMessage = message; _pin = ''; });
   }
 
-  void _navigateToDashboard() {
+  /// Post-unlock destination: resolves the saved role and lands on the
+  /// role picker (first run) or that role's dashboard.
+  void _navigateAfterAuth() {
     if (!mounted) return;
     Navigator.of(context).pushReplacement(
-      MaterialPageRoute(builder: (_) => const DashboardScreen()),
+      MaterialPageRoute(builder: (_) => const AfterAuthGate()),
     );
   }
 

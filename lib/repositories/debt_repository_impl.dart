@@ -43,9 +43,18 @@ class DebtRepositoryImpl implements IDebtRepository {
       conditions.add('status = ?');
       args.add(statusFilter.name);
     }
-    if (search != null && search.isNotEmpty) {
-      conditions.add('lender_name LIKE ?');
-      args.add('%$search%');
+    if (search != null) {
+      // Trim whitespace and neutralize LIKE wildcards so "50%" or "John_S"
+      // match literally instead of acting as % and _ patterns.
+      final term = search.trim();
+      if (term.isNotEmpty) {
+        final escaped = term
+            .replaceAll(r'\', r'\\')
+            .replaceAll('%', r'\%')
+            .replaceAll('_', r'\_');
+        conditions.add(r"lender_name LIKE ? ESCAPE '\'");
+        args.add('%$escaped%');
+      }
     }
 
     final rows = await db.query(
@@ -75,10 +84,14 @@ class DebtRepositoryImpl implements IDebtRepository {
   @override
   Future<int> deleteDebt(int id) async {
     final db = await _db;
-    await db
-        .delete('interest_history', where: 'debt_id = ?', whereArgs: [id]);
-    await db.delete('payment_history', where: 'debt_id = ?', whereArgs: [id]);
-    return db.delete('debts', where: 'id = ?', whereArgs: [id]);
+    // One transaction so a crash can never orphan history rows.
+    final deleted = await db.transaction<int>((txn) async {
+      await txn
+          .delete('interest_history', where: 'debt_id = ?', whereArgs: [id]);
+      await txn.delete('payment_history', where: 'debt_id = ?', whereArgs: [id]);
+      return txn.delete('debts', where: 'id = ?', whereArgs: [id]);
+    });
+    return deleted;
   }
 
   @override
@@ -144,6 +157,61 @@ class DebtRepositoryImpl implements IDebtRepository {
       [debtId, dateStr, nextDay],
     );
     return (rows.first['count'] as int) > 0;
+  }
+
+  @override
+  Future<List<DateTime>> getAppliedInterestDates(int debtId) async {
+    final db = await _db;
+    final rows = await db.query(
+      'interest_history',
+      columns: ['applied_at'],
+      where: 'debt_id = ?',
+      whereArgs: [debtId],
+    );
+    final dates = <DateTime>[];
+    for (final row in rows) {
+      final parsed = DateTime.tryParse(row['applied_at'] as String);
+      if (parsed != null) {
+        dates.add(DateTime(parsed.year, parsed.month, parsed.day));
+      }
+    }
+    return dates;
+  }
+
+  @override
+  Future<void> recordPaymentAtomic({
+    required PaymentHistory payment,
+    required Debt updatedDebt,
+  }) async {
+    final db = await _db;
+    await db.transaction((txn) async {
+      await txn.insert('payment_history', payment.toMap()..remove('id'));
+      await txn.update(
+        'debts',
+        updatedDebt.toMap()..remove('id'),
+        where: 'id = ?',
+        whereArgs: [updatedDebt.id],
+      );
+    });
+  }
+
+  @override
+  Future<void> applyInterestAtomic({
+    required Debt updatedDebt,
+    required List<InterestTransaction> transactions,
+  }) async {
+    final db = await _db;
+    await db.transaction((txn) async {
+      for (final transaction in transactions) {
+        await txn.insert('interest_history', transaction.toMap()..remove('id'));
+      }
+      await txn.update(
+        'debts',
+        updatedDebt.toMap()..remove('id'),
+        where: 'id = ?',
+        whereArgs: [updatedDebt.id],
+      );
+    });
   }
 
   @override

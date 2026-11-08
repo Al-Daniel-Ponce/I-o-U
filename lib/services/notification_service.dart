@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:flutter_timezone/flutter_timezone.dart';
 import 'package:timezone/data/latest_all.dart' as tz;
 import 'package:timezone/timezone.dart' as tz;
 
@@ -31,6 +32,11 @@ class NotificationService {
   /// Callback to persist the next reminder date to the database.
   Future<void> Function(int debtId, DateTime nextDate)? onPersistNextDate;
 
+  /// Whether exact (precise) alarms are permitted. False after Android 13+
+  /// when the user has not granted SCHEDULE_EXACT_ALARM — we then degrade
+  /// to inexact scheduling instead of throwing.
+  bool _exactAlarmsEnabled = true;
+
   NotificationService({Logger? logger})
       : _logger = logger ?? const Logger('NotificationService');
 
@@ -45,6 +51,7 @@ class NotificationService {
   /// Initializes the notification plugin, channels, and action handling.
   Future<void> initialize() async {
     tz.initializeTimeZones();
+    await _refreshDeviceTimezone();
 
     const androidSettings =
         AndroidInitializationSettings('@mipmap/ic_launcher');
@@ -60,7 +67,7 @@ class NotificationService {
 
     await _plugin.initialize(
       initSettings,
-      onDidReceiveNotificationResponse: _onNotificationResponse,
+      onDidReceiveNotificationResponse: _handleNotificationResponse,
     );
 
     // Create Android notification channel
@@ -80,7 +87,63 @@ class NotificationService {
       );
     }
 
+    await _configureExactAlarms(androidPlugin);
+    await _bootstrapFromColdStart();
+
     _logger.info('NotificationService initialized');
+  }
+
+  /// Sets `tz.local` to the device's actual timezone so "9:00 AM" means
+  /// 9:00 AM on the user's clock, not 9:00 UTC (5:00 PM Philippine time).
+  Future<void> _refreshDeviceTimezone() async {
+    try {
+      final info = await FlutterTimezone.getLocalTimezone();
+      tz.setLocalLocation(tz.getLocation(info.identifier));
+    } catch (e) {
+      // Offset-only or unsupported identifiers fall back to UTC scheduling;
+      // timestamps still resolve to the same absolute instant.
+      _logger.error('Could not set device timezone, scheduling in UTC', e);
+    }
+  }
+
+  /// Android 12+ gates exact alarms behind SCHEDULE_EXACT_ALARM, which is
+  /// denied by default for newer installs. Ask for it once and remember the
+  /// verdict so scheduling can degrade to inexact instead of throwing.
+  Future<void> _configureExactAlarms(
+    AndroidFlutterLocalNotificationsPlugin? androidPlugin,
+  ) async {
+    if (androidPlugin == null) return;
+    try {
+      await androidPlugin.requestExactAlarmsPermission();
+    } catch (e) {
+      _logger.error('Exact alarm permission request failed', e);
+    }
+    try {
+      _exactAlarmsEnabled =
+          await androidPlugin.canScheduleExactNotifications() ?? false;
+    } catch (e) {
+      _exactAlarmsEnabled = false;
+      _logger.error('Exact alarm capability query failed', e);
+    }
+    if (!_exactAlarmsEnabled) {
+      _logger.info('Exact alarms unavailable; reminders schedule inexact');
+    }
+  }
+
+  /// A tap on the notification can launch the app from a dead process. The
+  /// plugin delivers that response only once — during initialize(), when a
+  /// cold start was caused by one of our notifications — so route it here,
+  /// before the user sees any screen.
+  Future<void> _bootstrapFromColdStart() async {
+    try {
+      final details = await _plugin.getNotificationAppLaunchDetails();
+      final response = details?.notificationResponse;
+      if (details?.didNotificationLaunchApp == true && response != null) {
+        await _handleNotificationResponse(response);
+      }
+    } catch (e) {
+      _logger.error('Failed to process notification cold start', e);
+    }
   }
 
   /// Requests notification permissions (Android 13+, iOS).
@@ -157,7 +220,9 @@ class NotificationService {
             presentSound: true,
           ),
         ),
-        androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
+        androidScheduleMode: _exactAlarmsEnabled
+            ? AndroidScheduleMode.exactAllowWhileIdle
+            : AndroidScheduleMode.inexactAllowWhileIdle,
         uiLocalNotificationDateInterpretation:
             UILocalNotificationDateInterpretation.absoluteTime,
         matchDateTimeComponents: null,
@@ -209,7 +274,9 @@ class NotificationService {
             presentSound: true,
           ),
         ),
-        androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
+        androidScheduleMode: _exactAlarmsEnabled
+            ? AndroidScheduleMode.exactAllowWhileIdle
+            : AndroidScheduleMode.inexactAllowWhileIdle,
         uiLocalNotificationDateInterpretation:
             UILocalNotificationDateInterpretation.absoluteTime,
         payload: 'reminder|${debt.id}',
@@ -228,9 +295,16 @@ class NotificationService {
   }
 
   /// Cancels the scheduled notification for a specific debt.
+  ///
+  /// Wrapped: a platform hiccup on cancel must never abort the surrounding
+  /// operation (delete, payment) which has already succeeded logically.
   Future<void> cancelDebtReminder(int debtId) async {
-    await _plugin.cancel(debtId);
-    _logger.info('Cancelled reminder for debt $debtId');
+    try {
+      await _plugin.cancel(debtId);
+      _logger.info('Cancelled reminder for debt $debtId');
+    } catch (e) {
+      _logger.error('Failed to cancel reminder for debt $debtId', e);
+    }
   }
 
   /// Cancels all scheduled notifications.
@@ -308,42 +382,45 @@ class NotificationService {
     return scheduled;
   }
 
-  /// Handles notification response (action buttons).
-  void _onNotificationResponse(NotificationResponse response) {
+  /// Handles notification taps and action buttons.
+  ///
+  /// The button id ('paid' / 'later') rides on [NotificationResponse.actionId];
+  /// a plain body tap leaves actionId null. 'paid' and the reschedule chain
+  /// are awaited strictly to stop them racing on the same DB row.
+  Future<void> _handleNotificationResponse(NotificationResponse response) async {
     final payload = response.payload;
     if (payload == null) return;
 
     final parts = payload.split('|');
     if (parts.length != 2) return;
 
-    final action = parts[0];
     final debtId = int.tryParse(parts[1]);
     if (debtId == null) return;
 
+    final action = response.actionId ?? 'reminder';
     _logger.info('Notification action: $action for debt $debtId');
-    onAction?.call(action, debtId);
 
-    // Always reschedule the next reminder after a notification fires,
-    // regardless of which action was taken (or just tapping the body).
-    onReschedule?.call(debtId);
+    if (action == 'paid') {
+      // The payment handler cancels the reminder itself; rescheduling here
+      // would re-queue an alarm for a debt that is already settled.
+      await onAction?.call('paid', debtId);
+      return;
+    }
+
+    await onAction?.call(action, debtId);
+    await onReschedule?.call(debtId);
   }
 
-  /// Checks all active debts and reschedules reminders.
-  /// Used on app restart / resume to recover from missed notifications.
+  /// Reschedules reminders for active debts.
+  ///
+  /// Honors the persisted [Debt.nextReminderDate] (passed through
+  /// [scheduleDebtReminder]) so that using the app daily never pushes a
+  /// reminder forward — it fires on its original date.
   Future<void> rescheduleAllActive(List<Debt> activeDebts) async {
     for (final debt in activeDebts) {
       if (debt.reminderEnabled && !debt.isPaid && debt.id != null) {
         await cancelDebtReminder(debt.id!);
-        // Compute the next date from now so stale DB dates don't cause
-        // same-day scheduling.
-        final now = tz.TZDateTime.now(tz.local);
-        final nextDate = now.add(Duration(days: debt.reminderIntervalDays));
-        final actualDate =
-            DateTime(nextDate.year, nextDate.month, nextDate.day);
-        final updatedDebt = debt.copyWith(nextReminderDate: actualDate);
-        // Persist the updated date to the DB.
-        onPersistNextDate?.call(debt.id!, actualDate);
-        await scheduleDebtReminder(updatedDebt);
+        await scheduleDebtReminder(debt);
       }
     }
     _logger.info('Rescheduled ${activeDebts.length} active reminders');

@@ -9,6 +9,7 @@ import '../models/debt.dart';
 import '../services/service_locator.dart';
 import '../theme/app_theme.dart';
 import '../widgets/common/settings_drawer.dart';
+import '../widgets/dashboard/borrower_row.dart';
 import '../widgets/dashboard/debt_card.dart';
 import '../widgets/dashboard/summary_card.dart';
 import 'add_debt_screen.dart';
@@ -40,14 +41,23 @@ class _DashboardScreenState extends State<DashboardScreen>
   @override
   void initState() {
     super.initState();
-    _controller = DashboardController(ServiceLocator.instance.debtService)
+    // Assigned before the listener runs: loadData notifies synchronously.
+    _controller = DashboardController(ServiceLocator.instance.debtService);
+    _controller
       ..addListener(_onUpdate)
       ..loadData();
 
     _tabController = TabController(length: _filters.length, vsync: this);
   }
 
-  void _onUpdate() => setState(() {});
+  void _onUpdate() {
+    // Keep the field in sync when the controller replaces the query
+    // (e.g. tapping a borrower in the Borrowers view).
+    if (_searchController.text != _controller.searchQuery) {
+      _searchController.text = _controller.searchQuery;
+    }
+    setState(() {});
+  }
 
   @override
   void dispose() {
@@ -69,6 +79,8 @@ class _DashboardScreenState extends State<DashboardScreen>
 
   @override
   Widget build(BuildContext context) {
+    final borrowersView = _controller.view == DashboardView.borrowers;
+
     return Scaffold(
       key: _scaffoldKey,
       drawer: const SettingsDrawer(),
@@ -78,9 +90,14 @@ class _DashboardScreenState extends State<DashboardScreen>
           children: [
             _buildHeader(),
             SummaryCard(summary: _controller.summary),
-            _buildSearchBar(),
-            _buildFilterTabs(),
-            Expanded(child: _buildDebtList()),
+            _buildViewSwitch(),
+            if (!borrowersView) _buildSearchBar(),
+            if (!borrowersView && _controller.hasBorrowerFilter)
+              _buildBorrowerChip(),
+            if (!borrowersView) _buildFilterTabs(),
+            Expanded(
+              child: borrowersView ? _buildBorrowerList() : _buildDebtList(),
+            ),
           ],
         ),
       ),
@@ -192,6 +209,187 @@ class _DashboardScreenState extends State<DashboardScreen>
     );
   }
 
+  Widget _buildViewSwitch() {
+    final cardBg = _isDark ? AppTheme.cardBg : AppTheme.lCardBg;
+
+    return Container(
+      margin: const EdgeInsets.fromLTRB(20, 16, 20, 0),
+      padding: const EdgeInsets.all(4),
+      decoration: BoxDecoration(
+        color: cardBg,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: AppTheme.primary.withValues(alpha: 0.1)),
+      ),
+      child: Row(
+        children: [
+          _buildViewOption(
+            view: DashboardView.debts,
+            label: 'Debts',
+            icon: Icons.receipt_long_rounded,
+          ),
+          _buildViewOption(
+            view: DashboardView.borrowers,
+            label: 'Borrowers',
+            icon: Icons.people_alt_rounded,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildViewOption({
+    required DashboardView view,
+    required String label,
+    required IconData icon,
+  }) {
+    final selected = _controller.view == view;
+
+    return Expanded(
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: () => _controller.setView(view),
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 180),
+          curve: Curves.easeOut,
+          padding: const EdgeInsets.symmetric(vertical: 9),
+          decoration: BoxDecoration(
+            color: selected ? AppTheme.primary : Colors.transparent,
+            borderRadius: BorderRadius.circular(11),
+          ),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(
+                icon,
+                size: 16,
+                color: selected ? Colors.white : _textSecondary,
+              ),
+              const SizedBox(width: 7),
+              Text(
+                label,
+                style: GoogleFonts.dmSans(
+                  color: selected ? Colors.white : _textSecondary,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Removable chip shown when the list was narrowed from a borrower row.
+  Widget _buildBorrowerChip() {
+    final name = _controller.borrowerFilter ?? '';
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 12, 20, 0),
+      child: Row(
+        children: [
+          Container(
+            padding: const EdgeInsets.only(left: 12, top: 5, bottom: 5, right: 4),
+            decoration: BoxDecoration(
+              color: AppTheme.primary.withValues(alpha: 0.15),
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(color: AppTheme.primary.withValues(alpha: 0.35)),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.person_rounded,
+                    size: 15, color: AppTheme.primaryLight),
+                const SizedBox(width: 6),
+                ConstrainedBox(
+                  constraints: BoxConstraints(
+                    maxWidth: MediaQuery.of(context).size.width * 0.55,
+                  ),
+                  child: Text(
+                    name,
+                    overflow: TextOverflow.ellipsis,
+                    style: GoogleFonts.dmSans(
+                      color: AppTheme.primaryLight,
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+                IconButton(
+                  visualDensity: VisualDensity.compact,
+                  padding: EdgeInsets.zero,
+                  iconSize: 16,
+                  icon: Icon(Icons.close_rounded, color: _textMuted),
+                  tooltip: 'Clear filter',
+                  onPressed: _controller.clearBorrowerFilter,
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              'Only this borrower',
+              overflow: TextOverflow.ellipsis,
+              style: GoogleFonts.dmSans(color: _textMuted, fontSize: 12),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildBorrowerList() {
+    if (_controller.isLoading) {
+      return const Center(
+          child: CircularProgressIndicator(color: AppTheme.primary));
+    }
+    if (_controller.errorMessage != null) {
+      return Center(child: Text(_controller.errorMessage!,
+          style: GoogleFonts.dmSans(color: AppTheme.error)));
+    }
+    if (_controller.borrowers.isEmpty) {
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.people_outline_rounded, color: _textMuted, size: 48),
+            const SizedBox(height: 12),
+            Text(
+              'No borrowers yet',
+              style: GoogleFonts.spaceGrotesk(
+                  color: _textPrimary,
+                  fontSize: 18,
+                  fontWeight: FontWeight.w600),
+            ),
+            const SizedBox(height: 6),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 40),
+              child: Text(
+                'Everyone who owes you will be grouped here\nonce you add a debt.',
+                textAlign: TextAlign.center,
+                style:
+                    GoogleFonts.dmSans(color: _textSecondary, fontSize: 14),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    return ListView.builder(
+      padding: const EdgeInsets.fromLTRB(20, 16, 20, 100),
+      itemCount: _controller.borrowers.length,
+      itemBuilder: (_, i) {
+        final group = _controller.borrowers[i];
+        return BorrowerRow(
+          group: group,
+          onTap: () => _controller.selectBorrower(group),
+        );
+      },
+    );
+  }
+
   Widget _buildSearchBar() {
     return Padding(
       padding: const EdgeInsets.fromLTRB(20, 16, 20, 0),
@@ -293,30 +491,42 @@ class _EmptyState extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Center(
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(
-            hasFilter
-                ? Icons.filter_list_off_rounded
-                : Icons.account_balance_wallet_outlined,
-            color: textMuted, size: 48,
+    // Scroll-safe: with a keyboard open (or a short viewport) the column can
+    // exceed the available height, and a bare Center+Column overflows.
+    return LayoutBuilder(
+      builder: (context, constraints) => SingleChildScrollView(
+        child: ConstrainedBox(
+          constraints: BoxConstraints(minHeight: constraints.maxHeight),
+          child: Center(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  hasFilter
+                      ? Icons.filter_list_off_rounded
+                      : Icons.account_balance_wallet_outlined,
+                  color: textMuted, size: 48,
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  hasFilter ? 'No results found' : 'No debts yet',
+                  style: GoogleFonts.spaceGrotesk(
+                      color: textPrimary,
+                      fontSize: 18,
+                      fontWeight: FontWeight.w600),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  hasFilter
+                      ? 'Try adjusting your filters'
+                      : 'Tap + to add your first debt record',
+                  style:
+                      GoogleFonts.dmSans(color: textSecondary, fontSize: 14),
+                ),
+              ],
+            ),
           ),
-          const SizedBox(height: 12),
-          Text(
-            hasFilter ? 'No results found' : 'No debts yet',
-            style: GoogleFonts.spaceGrotesk(
-                color: textPrimary, fontSize: 18, fontWeight: FontWeight.w600),
-          ),
-          const SizedBox(height: 6),
-          Text(
-            hasFilter
-                ? 'Try adjusting your filters'
-                : 'Tap + to add your first debt record',
-            style: GoogleFonts.dmSans(color: textSecondary, fontSize: 14),
-          ),
-        ],
+        ),
       ),
     );
   }

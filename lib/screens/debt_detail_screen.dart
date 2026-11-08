@@ -10,6 +10,7 @@ import '../theme/app_theme.dart';
 import '../widgets/common/currency_text.dart';
 import '../widgets/common/status_badge.dart';
 import 'add_debt_screen.dart';
+import 'debt_qr_screen.dart';
 
 /// Debt detail screen — pure view layer.
 class DebtDetailScreen extends StatefulWidget {
@@ -53,6 +54,14 @@ class _DebtDetailScreenState extends State<DebtDetailScreen> {
       appBar: AppBar(
         title: Text(_debt.lenderName),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.qr_code_2_rounded, size: 20),
+            tooltip: 'Share QR',
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => DebtQrScreen(debt: _debt)),
+            ),
+          ),
           if (!_debt.isPaid)
             IconButton(
               icon: const Icon(Icons.edit_rounded, size: 20),
@@ -220,7 +229,7 @@ class _DebtDetailScreenState extends State<DebtDetailScreen> {
         children: [
           Row(
             children: [
-              Icon(Icons.trending_up_rounded,
+              const Icon(Icons.trending_up_rounded,
                   color: AppTheme.accent, size: 18),
               const SizedBox(width: 8),
               Text('Interest Details',
@@ -604,92 +613,21 @@ class _DebtDetailScreenState extends State<DebtDetailScreen> {
   }
 
   Future<void> _showPaymentDialog() async {
-    final formKey = GlobalKey<FormState>();
-    final amountCtrl = TextEditingController();
-    final noteCtrl = TextEditingController();
-
-    await showDialog(
+    final result = await showDialog<({double amount, String? note})>(
       context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: AppTheme.cardBg,
-        title: Text('Partial Payment',
-            style: GoogleFonts.spaceGrotesk(color: AppTheme.textPrimary)),
-        content: Form(
-          key: formKey,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextFormField(
-                controller: amountCtrl,
-                keyboardType:
-                    const TextInputType.numberWithOptions(decimal: true),
-                inputFormatters: [
-                  FilteringTextInputFormatter.allow(RegExp(r'[\d.]'))
-                ],
-                autofocus: true,
-                style: GoogleFonts.spaceGrotesk(
-                    color: AppTheme.textPrimary,
-                    fontWeight: FontWeight.w600,
-                    fontSize: 16),
-                decoration:
-                    const InputDecoration(labelText: 'Payment Amount (₱)'),
-                validator: (v) {
-                  if (v == null || v.isEmpty) return 'Enter an amount';
-                  final amt = double.tryParse(v);
-                  if (amt == null || amt <= 0) return 'Enter a valid amount';
-                  if (amt > _debt.remainingBalance) {
-                    return 'Payment cannot exceed balance';
-                  }
-                  return null;
-                },
-              ),
-              const SizedBox(height: 12),
-              TextFormField(
-                controller: noteCtrl,
-                style: GoogleFonts.dmSans(color: AppTheme.textPrimary),
-                decoration: const InputDecoration(
-                    labelText: 'Note (optional)',
-                    hintText: 'e.g. Cash payment'),
-              ),
-            ],
-          ),
+      builder: (_) => _PaymentDialog(maxAmount: _debt.remainingBalance),
+    );
+    if (result == null) return;
+
+    await _controller.recordPayment(amount: result.amount, note: result.note);
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          'Payment of ₱${NumberFormat("#,##0.00").format(result.amount)} recorded!',
+          style: GoogleFonts.dmSans(color: Colors.white),
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: Text('Cancel',
-                style: GoogleFonts.dmSans(color: AppTheme.textSecondary)),
-          ),
-          ElevatedButton(
-            style:
-                ElevatedButton.styleFrom(backgroundColor: AppTheme.partialColor),
-            onPressed: () async {
-              if (!formKey.currentState!.validate()) return;
-              final amount = double.parse(amountCtrl.text);
-              Navigator.pop(ctx);
-              await _controller.recordPayment(
-                amount: amount,
-                note: noteCtrl.text.trim().isEmpty
-                    ? null
-                    : noteCtrl.text.trim(),
-              );
-              if (mounted) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  SnackBar(
-                    content: Text(
-                      'Payment of ₱${NumberFormat("#,##0.00").format(amount)} recorded!',
-                      style: GoogleFonts.dmSans(color: Colors.white),
-                    ),
-                    backgroundColor: AppTheme.paidColor,
-                  ),
-                );
-              }
-            },
-            child: Text('Partial Payment',
-                style: GoogleFonts.dmSans(
-                    color: Colors.white, fontWeight: FontWeight.w600)),
-          ),
-        ],
+        backgroundColor: AppTheme.paidColor,
       ),
     );
   }
@@ -717,6 +655,105 @@ class _DebtDetailScreenState extends State<DebtDetailScreen> {
 }
 
 // ── Private sub-widgets ────────────────────────────────────────────────────────
+
+/// Partial-payment form.
+///
+/// Owns its controllers so they are disposed with the route, instead of
+/// leaking on every open (and never while the field is still mounted).
+class _PaymentDialog extends StatefulWidget {
+  final double maxAmount;
+
+  const _PaymentDialog({required this.maxAmount});
+
+  @override
+  State<_PaymentDialog> createState() => _PaymentDialogState();
+}
+
+class _PaymentDialogState extends State<_PaymentDialog> {
+  final _formKey = GlobalKey<FormState>();
+  final _amountCtrl = TextEditingController();
+  final _noteCtrl = TextEditingController();
+
+  @override
+  void dispose() {
+    _amountCtrl.dispose();
+    _noteCtrl.dispose();
+    super.dispose();
+  }
+
+  void _submit() {
+    if (!_formKey.currentState!.validate()) return;
+    final note = _noteCtrl.text.trim();
+    Navigator.pop(context, (
+      amount: double.parse(_amountCtrl.text),
+      note: note.isEmpty ? null : note,
+    ));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      backgroundColor: AppTheme.cardBg,
+      title: Text('Partial Payment',
+          style: GoogleFonts.spaceGrotesk(color: AppTheme.textPrimary)),
+      content: Form(
+        key: _formKey,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextFormField(
+              controller: _amountCtrl,
+              keyboardType:
+                  const TextInputType.numberWithOptions(decimal: true),
+              inputFormatters: [
+                FilteringTextInputFormatter.allow(RegExp(r'[\d.]'))
+              ],
+              autofocus: true,
+              style: GoogleFonts.spaceGrotesk(
+                  color: AppTheme.textPrimary,
+                  fontWeight: FontWeight.w600,
+                  fontSize: 16),
+              decoration:
+                  const InputDecoration(labelText: 'Payment Amount (₱)'),
+              validator: (v) {
+                if (v == null || v.isEmpty) return 'Enter an amount';
+                final amt = double.tryParse(v);
+                if (amt == null || amt <= 0) return 'Enter a valid amount';
+                if (amt > widget.maxAmount) {
+                  return 'Payment cannot exceed balance';
+                }
+                return null;
+              },
+            ),
+            const SizedBox(height: 12),
+            TextFormField(
+              controller: _noteCtrl,
+              style: GoogleFonts.dmSans(color: AppTheme.textPrimary),
+              decoration: const InputDecoration(
+                  labelText: 'Note (optional)',
+                  hintText: 'e.g. Cash payment'),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: Text('Cancel',
+              style: GoogleFonts.dmSans(color: AppTheme.textSecondary)),
+        ),
+        ElevatedButton(
+          style:
+              ElevatedButton.styleFrom(backgroundColor: AppTheme.partialColor),
+          onPressed: _submit,
+          child: Text('Partial Payment',
+              style: GoogleFonts.dmSans(
+                  color: Colors.white, fontWeight: FontWeight.w600)),
+        ),
+      ],
+    );
+  }
+}
 
 class _Divider extends StatelessWidget {
   @override
@@ -818,8 +855,8 @@ class _PaymentItem extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final accentColor = AppTheme.paidColor;
-    final icon = Icons.check_rounded;
+    const accentColor = AppTheme.paidColor;
+    const icon = Icons.check_rounded;
 
     return Container(
       margin: const EdgeInsets.only(bottom: 10),
@@ -837,7 +874,7 @@ class _PaymentItem extends StatelessWidget {
               color: accentColor.withValues(alpha: 0.1),
               borderRadius: BorderRadius.circular(10),
             ),
-            child: Icon(icon, color: accentColor, size: 16),
+            child: const Icon(icon, color: accentColor, size: 16),
           ),
           const SizedBox(width: 12),
           Expanded(
@@ -896,7 +933,7 @@ class _InterestTransactionItem extends StatelessWidget {
                   color: AppTheme.accent.withValues(alpha: 0.1),
                   borderRadius: BorderRadius.circular(8),
                 ),
-                child: Icon(Icons.trending_up_rounded,
+                child: const Icon(Icons.trending_up_rounded,
                     color: AppTheme.accent, size: 14),
               ),
               const SizedBox(width: 10),

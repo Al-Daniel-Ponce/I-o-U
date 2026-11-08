@@ -20,7 +20,10 @@ class AddDebtController extends ChangeNotifier {
   String? _errorMessage;
   String? get errorMessage => _errorMessage;
 
-  Future<void> save({
+  /// Persists the form. Returns the saved [Debt] on a successful *create*
+  /// (used to offer QR sharing straight away), the edited record on update,
+  /// or `null` when the save failed — see [errorMessage].
+  Future<Debt?> save({
     required String lenderName,
     required double amount,
     required DateTime transactionDate,
@@ -59,25 +62,26 @@ class AddDebtController extends ChangeNotifier {
           reminderStartDate: reminderStartDate,
           reminderIntervalDays: reminderIntervalDays,
         );
-      } else {
-        await _debtService.addDebt(
-          lenderName: lenderName,
-          amount: amount,
-          transactionDate: transactionDate,
-          notes: notes,
-          interestRate: interestRate,
-          interestType: interestType,
-          interestMode: interestMode,
-          interestFrequencyDays: interestFrequencyDays,
-          interestStartDate: interestStartDate,
-          reminderEnabled: reminderEnabled,
-          reminderStartDate: reminderStartDate,
-          reminderIntervalDays: reminderIntervalDays,
-        );
+        return existingDebt;
       }
+      return await _debtService.addDebt(
+        lenderName: lenderName,
+        amount: amount,
+        transactionDate: transactionDate,
+        notes: notes,
+        interestRate: interestRate,
+        interestType: interestType,
+        interestMode: interestMode,
+        interestFrequencyDays: interestFrequencyDays,
+        interestStartDate: interestStartDate,
+        reminderEnabled: reminderEnabled,
+        reminderStartDate: reminderStartDate,
+        reminderIntervalDays: reminderIntervalDays,
+      );
     } catch (e, stack) {
       _logger.error('Failed to save debt', e, stack);
       _errorMessage = 'Failed to save debt. Please try again.';
+      return null;
     } finally {
       _isSaving = false;
       notifyListeners();

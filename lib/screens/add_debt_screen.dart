@@ -10,6 +10,7 @@ import '../models/debt.dart';
 import '../services/service_locator.dart';
 import '../theme/app_theme.dart';
 import '../widgets/common/section_label.dart';
+import 'debt_qr_screen.dart';
 
 /// Add / Edit Debt screen — pure view layer.
 class AddDebtScreen extends StatefulWidget {
@@ -103,7 +104,7 @@ class _AddDebtScreenState extends State<AddDebtScreen> {
     _interestRateController.dispose();
     _customFrequencyController.dispose();
     _customReminderFrequencyController.dispose();
-    super.dispose();
+    super.dispose();  
   }
 
   Future<void> _pickDate() async {
@@ -126,10 +127,16 @@ class _AddDebtScreenState extends State<AddDebtScreen> {
   }
 
   Future<void> _pickInterestStartDate() async {
+    final now = DateTime.now();
+    final existing = _interestStartDate;
     final picked = await showDatePicker(
       context: context,
-      initialDate: _interestStartDate ?? DateTime.now().add(Duration(days: 1)),
-      firstDate: DateTime.now(),
+      // initialDate must fall within [firstDate, lastDate] or the picker
+      // asserts; a stored past start date would crash the edit screen.
+      initialDate: existing != null && !existing.isBefore(now)
+          ? existing
+          : now.add(const Duration(days: 1)),
+      firstDate: now,
       lastDate: DateTime(2100),
       builder: (ctx, child) => Theme(
         data: Theme.of(context).copyWith(
@@ -145,11 +152,16 @@ class _AddDebtScreenState extends State<AddDebtScreen> {
   }
 
   Future<void> _pickReminderStartDate() async {
+    final now = DateTime.now();
+    final existing = _reminderStartDate;
     final picked = await showDatePicker(
       context: context,
-      initialDate: _reminderStartDate ??
-          DateTime.now().add(Duration(days: 1)),
-      firstDate: DateTime.now(),
+      // Same guard as the interest picker: never hand the picker an
+      // initialDate before its firstDate.
+      initialDate: existing != null && !existing.isBefore(now)
+          ? existing
+          : now.add(const Duration(days: 1)),
+      firstDate: now,
       lastDate: DateTime(2100),
       builder: (ctx, child) => Theme(
         data: Theme.of(context).copyWith(
@@ -202,7 +214,26 @@ class _AddDebtScreenState extends State<AddDebtScreen> {
       reminderStartDate = _selectedDate.add(Duration(days: reminderIntervalDays));
     }
 
-    await _controller.save(
+    // Automatic interest is only ever applied when a start date exists —
+    // with one missing, interest_service skips the debt silently forever.
+    // Block the save instead of creating a debt that will never accrue.
+    if (_hasInterest &&
+        _interestMode == InterestMode.automatic &&
+        _interestStartDate == null) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Pick when interest should start.',
+            style: GoogleFonts.dmSans(color: Colors.white),
+          ),
+          backgroundColor: AppTheme.error,
+        ),
+      );
+      return;
+    }
+
+    final savedDebt = await _controller.save(
       lenderName: _lenderController.text,
       amount: amount,
       transactionDate: _selectedDate,
@@ -219,18 +250,61 @@ class _AddDebtScreenState extends State<AddDebtScreen> {
       reminderIntervalDays: reminderIntervalDays,
     );
 
-    if (mounted) {
+    if (!mounted) return;
+
+    final error = _controller.errorMessage;
+    if (error != null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(error, style: GoogleFonts.dmSans(color: Colors.white)),
+          backgroundColor: AppTheme.error,
+        ),
+      );
+      return;
+    }
+
+    if (_controller.isEditing) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            _controller.isEditing ? 'Debt record updated!' : 'Debt record saved!',
+            'Debt record updated!',
             style: GoogleFonts.dmSans(color: AppTheme.textPrimary),
           ),
           backgroundColor: AppTheme.success,
         ),
       );
       Navigator.pop(context, true);
+      return;
     }
+
+    // Newly created debt: show the QR receipt right away. The save
+    // confirmation is deliberately *not* fired here — a snackbar renders over
+    // this screen's bottom (exactly where the receipt's Done button sits)
+    // and would swallow taps for its lifetime. It is shown once we come back.
+    final created = savedDebt;
+    if (created == null) {
+      // Defensive: save() reports failures via errorMessage (handled above),
+      // but never crash on an unexpected null.
+      if (mounted) Navigator.pop(context);
+      return;
+    }
+    final method = MaterialPageRoute(builder: (_) => DebtQrScreen(debt: created));
+    await Navigator.push(context, method);
+    if (!mounted) return;
+
+    // Back from the receipt: pop the form and confirm on the dashboard,
+    // where the snackbar can no longer cover anything interactive.
+    final messenger = ScaffoldMessenger.of(context);
+    Navigator.pop(context, true);
+    messenger.showSnackBar(
+      SnackBar(
+        content: Text(
+          'Debt record saved!',
+          style: GoogleFonts.dmSans(color: AppTheme.textPrimary),
+        ),
+        backgroundColor: AppTheme.success,
+      ),
+    );
   }
 
   @override

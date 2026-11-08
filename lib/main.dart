@@ -4,8 +4,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'controllers/theme_controller.dart';
-import 'screens/dashboard_screen.dart';
+import 'screens/after_auth_gate.dart';
 import 'screens/pin_screen.dart';
+import 'services/logger.dart';
 import 'services/service_locator.dart';
 import 'theme/app_theme.dart';
 
@@ -20,16 +21,16 @@ void main() async {
     statusBarIconBrightness: Brightness.light,
   ));
 
-  // Initialize notification service
+  // Assign the notification callbacks BEFORE initialize(): a cold start
+  // triggered by a notification tap delivers its response inside
+  // initialize(), and the handlers must already be in place for it.
   final notificationService = ServiceLocator.instance.notificationService;
-  await notificationService.initialize();
-  await notificationService.requestPermission();
-
-  // Set up notification action handler
   final debtService = ServiceLocator.instance.debtService;
+
   notificationService.onAction = (action, debtId) async {
+    // Only 'Mark as Paid' routes here. Every other action reschedules
+    // through onReschedule so the chain runs exactly once per tap.
     if (action == 'paid') {
-      // Mark as paid
       final debt = await debtService.getDebtById(debtId);
       if (debt != null && !debt.isPaid) {
         await debtService.recordPayment(
@@ -38,14 +39,10 @@ void main() async {
           note: 'Paid via notification',
         );
       }
-    } else if (action == 'later' || action == 'reminder') {
-      // Reschedule for next interval
-      await debtService.rescheduleNextReminder(debtId);
     }
   };
 
-  // Auto-reschedule next reminder whenever a notification fires,
-  // regardless of which action the user takes.
+  // Reschedule the next reminder after the notification fires or is tapped.
   notificationService.onReschedule = (debtId) async {
     await debtService.rescheduleNextReminder(debtId);
   };
@@ -55,12 +52,24 @@ void main() async {
     await debtService.persistNextReminderDate(debtId, nextDate);
   };
 
-  // Reschedule all active reminders on app start
-  final activeDebts = await debtService.getDebtsWithActiveReminders();
-  await notificationService.rescheduleAllActive(activeDebts);
+  try {
+    await notificationService.initialize();
+    await notificationService.requestPermission();
+
+    // Reschedule all active reminders on app start (honors persisted dates).
+    final activeDebts = await debtService.getDebtsWithActiveReminders();
+    await notificationService.rescheduleAllActive(activeDebts);
+  } catch (e, stack) {
+    const Logger('main')
+        .error('Notification bootstrap failed; continuing without', e, stack);
+  }
 
   // Load persisted theme preference before first frame.
-  await ThemeController.instance.init();
+  try {
+    await ThemeController.instance.init();
+  } catch (e, stack) {
+    const Logger('main').error('Theme init failed; using default', e, stack);
+  }
 
   runApp(const IOUApp());
 }
@@ -142,46 +151,61 @@ class _SplashRouterState extends State<_SplashRouter>
   }
 
   Future<void> _navigate() async {
-    await Future.delayed(const Duration(milliseconds: 1800));
+    try {
+      await Future.delayed(const Duration(milliseconds: 1800));
 
-    final authService = ServiceLocator.instance.authService;
-    final biometricService = ServiceLocator.instance.biometricService;
+      final authService = ServiceLocator.instance.authService;
+      final biometricService = ServiceLocator.instance.biometricService;
 
-    final pinSet = await authService.isPinSet();
+      final pinSet = await authService.isPinSet();
 
-    if (!mounted) return;
+      if (!mounted) return;
 
-    // If PIN is set, try biometric auth before showing PIN screen
-    if (pinSet) {
-      final biometricsEnabled = await authService.isBiometricsEnabled();
-      final hasFingerprint = await biometricService.isFingerprintAvailable();
+      // If PIN is set, try biometric auth before showing PIN screen
+      if (pinSet) {
+        final biometricsEnabled = await authService.isBiometricsEnabled();
+        final hasFingerprint = await biometricService.isFingerprintAvailable();
 
-      if (biometricsEnabled && hasFingerprint) {
-        final authenticated = await biometricService.authenticate(
-          reason: 'Authenticate to access your debts',
-        );
+        if (biometricsEnabled && hasFingerprint) {
+          final authenticated = await biometricService.authenticate(
+            reason: 'Authenticate to access your debts',
+          );
 
-        if (authenticated && mounted) {
-          // Biometric success — go straight to dashboard
-          Navigator.of(context).pushReplacement(PageRouteBuilder(
-            pageBuilder: (_, __, ___) => const DashboardScreen(),
-            transitionsBuilder: (_, anim, __, child) =>
-                FadeTransition(opacity: anim, child: child),
-            transitionDuration: const Duration(milliseconds: 500),
-          ));
-          return;
+          if (authenticated && mounted) {
+            // Biometric success — same post-auth route as a PIN login:
+            // saved role's dashboard, or the role picker on first run.
+            Navigator.of(context).pushReplacement(PageRouteBuilder(
+              pageBuilder: (_, __, ___) => const AfterAuthGate(),
+              transitionsBuilder: (_, anim, __, child) =>
+                  FadeTransition(opacity: anim, child: child),
+              transitionDuration: const Duration(milliseconds: 500),
+            ));
+            return;
+          }
+          // Biometric failed/declined — fall through to PIN screen
         }
-        // Biometric failed/declined — fall through to PIN screen
       }
-    }
 
-    if (mounted) {
-      Navigator.of(context).pushReplacement(PageRouteBuilder(
-        pageBuilder: (_, __, ___) => PinScreen(isSetup: !pinSet),
-        transitionsBuilder: (_, anim, __, child) =>
-            FadeTransition(opacity: anim, child: child),
-        transitionDuration: const Duration(milliseconds: 500),
-      ));
+      if (mounted) {
+        Navigator.of(context).pushReplacement(PageRouteBuilder(
+          pageBuilder: (_, __, ___) => PinScreen(isSetup: !pinSet),
+          transitionsBuilder: (_, anim, __, child) =>
+              FadeTransition(opacity: anim, child: child),
+          transitionDuration: const Duration(milliseconds: 500),
+        ));
+      }
+    } catch (e, stack) {
+      // A failed DB/SETTINGS read must never strand the user on the splash
+      // spinner. Route to PIN setup as the safest fallback gate.
+      const Logger('Splash').error('Splash navigation failed', e, stack);
+      if (mounted) {
+        Navigator.of(context).pushReplacement(PageRouteBuilder(
+          pageBuilder: (_, __, ___) => const PinScreen(isSetup: true),
+          transitionsBuilder: (_, anim, __, child) =>
+              FadeTransition(opacity: anim, child: child),
+          transitionDuration: const Duration(milliseconds: 500),
+        ));
+      }
     }
   }
 

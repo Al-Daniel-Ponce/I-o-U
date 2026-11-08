@@ -88,10 +88,22 @@ class _RecoveryScreenState extends State<RecoveryScreen>
   }
 
   Future<void> _loadQuestion() async {
-    final answer =
-        await ServiceLocator.instance.authService.getSecurityAnswer();
+    final authService = ServiceLocator.instance.authService;
+    final answer = await authService.getSecurityAnswer();
+    // Restore the persisted attempt count and any active lockout so the
+    // 30s/60s/permanent tiers survive app restarts.
+    final attempts = await authService.failedAttempts(recovery: true);
+    final remaining = await authService.lockRemaining(recovery: true);
+    if (!mounted) return;
     setState(() {
       _questionText = answer?.question?.question ?? 'Security question not set.';
+      _failedAttempts = attempts;
+      if (attempts >= _tier3Attempts) {
+        _lockState = _LockState.permanent;
+      } else if (remaining != null) {
+        _startCountdown(remaining.inSeconds < 1 ? 1 : remaining.inSeconds,
+            persist: false);
+      }
     });
   }
 
@@ -106,10 +118,13 @@ class _RecoveryScreenState extends State<RecoveryScreen>
 
   // ── Lockout helpers ────────────────────────────────────────────────────────
 
-  /// Called after every failed attempt. Determines whether a lockout tier
-  /// should be activated and starts the countdown if needed.
-  void _handleFailedAttempt() {
-    _failedAttempts++;
+  /// Called after every failed attempt. Persists the counter, determines
+  /// whether a lockout tier should activate, and starts the countdown.
+  Future<void> _handleFailedAttempt() async {
+    final authService = ServiceLocator.instance.authService;
+    _failedAttempts =
+        await authService.recordFailedAttempt(recovery: true);
+    if (!mounted) return;
 
     if (_failedAttempts >= _tier3Attempts) {
       // Permanent lock — show nuke button.
@@ -136,7 +151,13 @@ class _RecoveryScreenState extends State<RecoveryScreen>
     _shakeCtrl.forward(from: 0);
   }
 
-  void _startCountdown(int seconds) {
+  void _startCountdown(int seconds, {bool persist = true}) {
+    if (persist) {
+      ServiceLocator.instance.authService
+          .lockUntil(
+              recovery: true,
+              until: DateTime.now().add(Duration(seconds: seconds)));
+    }
     _countdownTimer?.cancel();
     setState(() {
       _lockState = _LockState.countdown;
@@ -154,6 +175,8 @@ class _RecoveryScreenState extends State<RecoveryScreen>
           timer.cancel();
           _lockState = _LockState.open;
           _answerError = '';
+          ServiceLocator.instance.authService
+              .lockUntil(recovery: true, until: null);
         }
       });
     });
@@ -234,12 +257,18 @@ class _RecoveryScreenState extends State<RecoveryScreen>
     setState(() { _isVerifying = true; _answerError = ''; });
     final ok = await ServiceLocator.instance.authService
         .verifySecurityAnswer(_answerController.text);
+    if (!mounted) return;
     setState(() => _isVerifying = false);
 
     if (ok) {
+      // Correct answer: clear the persisted attempt count and lock state.
+      final authService = ServiceLocator.instance.authService;
+      await authService.resetFailedAttempts(recovery: true);
+      await authService.lockUntil(recovery: true, until: null);
+      if (!mounted) return;
       setState(() => _step = _RecoveryStep.newPin);
     } else {
-      _handleFailedAttempt();
+      await _handleFailedAttempt();
     }
   }
 
